@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>事务交错推演 · Read Uncommitted / Read Committed / Snapshot Isolation</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #181f2e;
+    --panel2: #1f2839;
+    --line: #2c3850;
+    --text: #e6ecf5;
+    --muted: #93a1b8;
+    --accent: #5b8cff;
+    --t1: #5b8cff;
+    --t2: #f2a65a;
+    --t3: #54c08e;
+    --green: #46c98f;
+    --amber: #e8b34a;
+    --red: #ef6b6b;
+    --purple: #b18cff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.55;
+  }
+  header {
+    padding: 18px 26px 14px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #16203a, #11182a);
+  }
+  header h1 { margin: 0; font-size: 20px; letter-spacing: .5px; }
+  header p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+  main { padding: 18px 26px 60px; max-width: 1500px; margin: 0 auto; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px 18px; margin-bottom: 16px;
+  }
+  .panel h2 { margin: 0 0 12px; font-size: 15px; color: #cdd9ee; }
+  .cfg-grid { display: grid; grid-template-columns: 340px 1fr; gap: 16px; }
+  textarea {
+    width: 100%; background: #0d1320; color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; font-family: var(--mono); font-size: 13px;
+    line-height: 1.6; resize: vertical; tab-size: 8;
+  }
+  textarea:focus, button:focus { outline: 2px solid rgba(91,140,255,.45); }
+  label.field { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .txn-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .txn-box textarea { min-height: 168px; }
+  .txn-head { display: flex; align-items: center; gap: 8px; margin-bottom:6px; }
+  .txn-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .txn-head .name { font-weight: 700; font-family: var(--mono); }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; align-items: center; }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  button:hover { background: #283450; border-color: #3d4f70; }
+  button.primary { background: #2f5fe0; border-color: #3a6bf0; font-weight: 600; }
+  button.primary:hover { background: #3f6ff5; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  code { font-family: var(--mono); background: #0d1320; padding: 1px 6px; border-radius: 4px;
+         border: 1px solid var(--line); font-size: 12px; }
+  .error-box {
+    display: none; margin-top: 12px; padding: 10px 14px; border-radius: 8px;
+    background: rgba(239,107,107,.12); border: 1px solid rgba(239,107,107,.5);
+    color: #ffb4b4; font-size: 13px;
+  }
+  /* Tabs */
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tab {
+    padding: 9px 18px; border-radius: 8px 8px 0 0; border: 1px solid var(--line);
+    background: var(--panel2); cursor: pointer; font-size: 13px;
+    border-bottom: none; color: var(--muted);
+  }
+  .tab.active { background: var(--panel); color: var(--text); font-weight: 700; }
+  .tab .verdict { margin-left: 8px; font-size: 11px; font-weight: 600; padding: 1px 7px;
+                  border-radius: 10px; vertical-align: 1px; }
+  .verdict.ok { background: rgba(70,201,143,.18); color: var(--green); }
+  .verdict.bad { background: rgba(239,107,107,.18); color: var(--red); }
+  /* Toolbar */
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .toolbar .pos { font-family: var(--mono); color: var(--muted); font-size: 13px; }
+  .chips {
+    display: flex; gap: 6px; overflow-x: auto; padding: 8px 4px 10px;
+    border-bottom: 1px solid var(--line); margin-bottom: 14px;
+  }
+  .chip {
+    flex: 0 0 auto; font-family: var(--mono); font-size: 11px;
+    border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px;
+    background: #0d1320; color: var(--muted); cursor: pointer; white-space: nowrap;
+  }
+  .chip .cseq { color: #5b6b86; margin-right: 5px; }
+  .chip.done { color: var(--text); }
+  .chip.current { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .chip.cycle { border-color: var(--red); }
+  .chip.dirty { background: rgba(232,179,74,.14); border-color: #8a6a22; color: #ffd98a; }
+  .content-grid { display: grid; grid-template-columns: minmax(0,1fr) 430px; gap: 16px; align-items: start; }
+  @media (max-width: 1100px) { .content-grid { grid-template-columns: 1fr; } .cfg-grid { grid-template-columns: 1fr; } .txn-grid { grid-template-columns: 1fr; } }
+  /* Step card */
+  .step-card { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .step-card.cycle { border-color: rgba(239,107,107,.8); box-shadow: 0 0 0 1px rgba(239,107,107,.4); }
+  .step-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .seq-badge { font-family: var(--mono); color: var(--muted); font-size: 13px; }
+  .txn-badge { font-family: var(--mono); font-weight: 700; padding: 2px 10px; border-radius: 12px; font-size: 12px; }
+  .op-text { font-family: var(--mono); font-size: 15px; font-weight: 600; }
+  .tag { font-size: 11px; padding: 2px 9px; border-radius: 11px; font-weight: 600; }
+  .tag.dirty { background: rgba(232,179,74,.18); color: var(--amber); }
+  .tag.cycle { background: rgba(239,107,107,.18); color: var(--red); }
+  .tag.info { background: rgba(91,140,255,.15); color: #8fb0ff; }
+  .step-info { margin: 10px 0 0; font-size: 14px; }
+  .kv-mini { margin-top: 12px; display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+  .kv-mini .k { color: var(--muted); }
+  .kv-mini .v { font-family: var(--mono); }
+  .snap-box { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+  .snap-box .snap-title { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  /* Version chains */
+  .chains { margin-top: 16px; }
+  .chain-block { margin-bottom: 12px; }
+  .chain-key { font-family: var(--mono); font-weight: 700; font-size: 13px; margin-bottom: 6px; }
+  .chain-row { display: flex; align-items: center; gap: 6px; overflow-x: auto; padding-bottom: 4px; }
+  .vbadge {
+    flex: 0 0 auto; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+    background: #0d1320; font-family: var(--mono); font-size: 12px; position: relative;
+    min-width: 92px;
+  }
+  .vbadge .vid { color: var(--muted); font-size: 11px; }
+  .vbadge .vval { font-weight: 700; font-size: 14px; }
+  .vbadge .vmeta { font-size: 10px; margin-top: 2px; color: var(--muted); }
+  .vbadge.initial { border-color: #445; }
+  .vbadge.uncommitted { border-color: #8a6a22; background: rgba(232,179,74,.08); }
+  .vbadge.committed { border-color: #2e7d5b; background: rgba(70,201,143,.08); }
+  .vbadge.aborted { border-color: #8a3a3a; opacity: .65; }
+  .vbadge.aborted .vval { text-decoration: line-through; }
+  .vbadge.hl-read { box-shadow: 0 0 0 2px var(--accent); }
+  .vbadge.hl-write { box-shadow: 0 0 0 2px var(--green); }
+  .vbadge.hl-conflict { box-shadow: 0 0 0 2px var(--red); }
+  .vbadge .ring-label {
+    position: absolute; top: -9px; right: -6px; font-size: 9px; font-weight: 700;
+    padding: 1px 5px; border-radius: 8px; color: #fff;
+  }
+  .ring-label.read { background: var(--accent); }
+  .ring-label.write { background: var(--green); }
+  .ring-label.conflict { background: var(--red); }
+  .arrow-right { color: #44506a; font-family: var(--mono); flex: 0 0 auto; }
+  /* Right column */
+  .right-col { display: flex; flex-direction: column; gap: 16px; }
+  .status-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .status-pill { font-family: var(--mono); font-size: 12px; padding: 4px 12px; border-radius: 14px;
+                 border: 1px solid var(--line); background: #0d1320; }
+  .status-pill.active { border-color: #3a6bf0; color: #9dbbff; }
+  .status-pill.committed { border-color: #2e7d5b; color: var(--green); }
+  .status-pill.aborted { border-color: #8a3a3a; color: var(--red); }
+  .status-pill.pending { color: var(--muted); }
+  .alert { border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 10px; }
+  .alert.cycle { background: rgba(239,107,107,.1); border: 1px solid rgba(239,107,107,.55); color: #ffb0b0; }
+  .alert.ok { background: rgba(70,201,143,.08); border: 1px solid rgba(70,201,143,.4); color: #9be8c6; }
+  .alert.dirty { background: rgba(232,179,74,.09); border: 1px solid rgba(232,179,74,.5); color: #ffd98a; }
+  .alert ul { margin: 6px 0 0; padding-left: 18px; }
+  .alert li { margin-bottom: 3px; font-family: var(--mono); font-size: 12px; }
+  svg.graph { width: 100%; height: 260px; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .legend span::before { content: ""; display: inline-block; width: 18px; height: 3px;
+                        vertical-align: middle; margin-right: 5px; border-radius: 2px; }
+  .legend .l-wr::before { background: var(--green); }
+  .legend .l-ww::before { background: var(--amber); }
+  .legend .l-rw::before { background: var(--purple); }
+  .graph-node-text { fill: var(--text); font-family: var(--mono); font-size: 13px; font-weight: 700;
+                     text-anchor: middle; dominant-baseline: central; }
+  .graph-sub { fill: var(--muted); font-size: 10px; text-anchor: middle; font-family: var(--mono); }
+  .edge-label { font-family: var(--mono); font-size: 10px; fill: #b9c6dd; text-anchor: middle;
+                dominant-baseline: central; paint-order: stroke; stroke: var(--panel); stroke-width: 3px; }
+  .placeholder { color: var(--muted); text-align: center; padding: 40px 10px; font-size: 13px; }
+  .examples-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .ex-desc { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  /* 调度对照 */
+  .order-area { margin-top: 16px; border-top: 1px dashed var(--line); padding-top: 12px; }
+  .order-area textarea { min-height: 44px; }
+  .cmp-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  @media (max-width: 1100px) { .cmp-grid { grid-template-columns: 1fr; } }
+  .cmp-card { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; font-size: 13px; }
+  .cmp-card h3 { margin: 0 0 8px; font-size: 13px; color: #cdd9ee; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cmp-diff { border-radius: 6px; padding: 8px 10px; font-size: 12px; margin-bottom: 8px; line-height: 1.6; }
+  .cmp-diff.same { background: rgba(70,201,143,.08); border: 1px solid rgba(70,201,143,.4); color: #9be8c6; }
+  .cmp-diff.diff { background: rgba(239,107,107,.09); border: 1px solid rgba(239,107,107,.5); color: #ffc9c9; }
+  .cmp-diff .f { font-family: var(--mono); }
+  .cmp-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .cmp-side { background: #0d1320; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 12px; }
+  .cmp-side .st { font-weight: 700; margin-bottom: 4px; color: #cdd9ee; }
+  .cmp-side ul { margin: 4px 0 0; padding-left: 16px; }
+  .cmp-side li { font-family: var(--mono); font-size: 11px; margin-bottom: 2px; }
+  details.cmp-all { margin-top: 6px; }
+  details.cmp-all summary { cursor: pointer; color: #e0a0a0; font-size: 11px; }
+  details.cmp-all ul { margin: 6px 0 0; padding-left: 16px; }
+  details.cmp-all li { font-size: 11px; margin-bottom: 3px; }
+  .chip.firstdiff { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); color: #ffb0b0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>事务交错推演（Transaction Interleaving Playground）</h1>
+  <p>编辑初始键值与 2～3 条事务脚本，轮转调度生成全局序列，逐步对比 Read Uncommitted、Read Committed、Snapshot Isolation 的读值来源、版本链与依赖图；也可输入自定义执行顺序，与默认轮转做调度对照。</p>
+</header>
+<main>
+  <section class="panel">
+    <h2>① 初始状态与事务脚本</h2>
+    <div class="cfg-grid">
+      <div>
+        <label class="field" for="initial">初始键值（每行 <code>key=value</code>）</label>
+        <textarea id="initial" rows="6" spellcheck="false">x=0
+y=0</textarea>
+        <div class="hint">支持整数、小数、true/false、null 与字符串。</div>
+        <div class="actions">
+          <button class="primary" id="runBtn">▶ 生成调度并推演</button>
+          <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;cursor:pointer">
+            <input type="checkbox" id="enableT3"> 启用 T3
+          </label>
+        </div>
+        <div class="order-area">
+          <label class="field" for="orderInput">调度对照 · 自定义执行顺序（由 T1/T2/T3 组成，空格或逗号分隔；每项取该事务尚未执行的队头操作，需恰好覆盖全部操作）</label>
+          <textarea id="orderInput" rows="2" spellcheck="false" placeholder="例如：T1 T2 T1 T2 T1 T2 …"></textarea>
+          <div class="actions" style="margin-top:8px">
+            <button class="order-add" data-name="T1">+ T1</button>
+            <button class="order-add" data-name="T2">+ T2</button>
+            <button class="order-add" data-name="T3">+ T3</button>
+            <button id="fillOrderBtn">填入轮转顺序</button>
+            <button id="clearOrderBtn">清空</button>
+            <button class="primary" id="compareBtn">⇄ 对照推演</button>
+          </div>
+        </div>
+        <div class="error-box" id="errorBox"></div>
+      </div>
+      <div>
+        <div class="txn-grid">
+          <div class="txn-box">
+            <div class="txn-head"><span class="txn-dot" style="background:var(--t1)"></span><span class="name">T1</span></div>
+            <textarea id="t1" spellcheck="false"></textarea>
+          </div>
+          <div class="txn-box">
+            <div class="txn-head"><span class="txn-dot" style="background:var(--t2)"></span><span class="name">T2</span></div>
+            <textarea id="t2" spellcheck="false"></textarea>
+          </div>
+          <div class="txn-box" id="t3box" style="display:none">
+            <div class="txn-head"><span class="txn-dot" style="background:var(--t3)"></span><span class="name">T3</span></div>
+            <textarea id="t3" spellcheck="false"></textarea>
+          </div>
+        </div>
+        <div class="hint">每行仅允许：<code>BEGIN</code>、<code>READ key</code>、<code>WRITE key value</code>、<code>COMMIT</code>、<code>ABORT</code>；必须以 BEGIN 开头、COMMIT 或 ABORT 结尾。</div>
+      </div>
+    </div>
+    <div class="actions" style="margin-top:16px">
+      <span style="color:var(--muted);font-size:13px">一键加载示例：</span>
+      <div class="examples-row" id="examplesRow"></div>
+    </div>
+  </section>
+
+  <section id="resultSection" style="display:none">
+    <div class="panel" id="comparePanel" style="display:none">
+      <h2>调度对照：默认轮转 ↔ 自定义顺序</h2>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+        自定义顺序：<code id="cmpOrderText"></code><br>
+        两侧各自独立运行 RU / RC / SI，按「事务名 + 事务内操作序号」对齐 READ / COMMIT / ABORT，
+        依默认轮转的步序标出读值、来源类型、写入者与结束状态的首次差异；下方可切换查看两侧逐步轨迹。
+      </div>
+      <div class="cmp-grid" id="compareSummary"></div>
+    </div>
+    <div class="tabs" id="sideTabs" style="display:none"></div>
+    <div class="tabs" id="tabs"></div>
+    <div class="panel">
+      <div class="toolbar">
+        <button id="prevBtn">◀ 上一步</button>
+        <button id="playBtn">⏩ 自动播放</button>
+        <button id="nextBtn">下一步 ▶</button>
+        <button id="resetBtn">⏮ 回到开头</button>
+        <span class="pos" id="posText"></span>
+      </div>
+      <div class="chips" id="chips"></div>
+      <div class="content-grid" style="margin-top:14px">
+        <div>
+          <div class="step-card" id="stepCard"></div>
+          <div class="chains" id="chainsBox"></div>
+        </div>
+        <div class="right-col">
+          <div id="alertsBox"></div>
+          <div class="panel" style="margin:0">
+            <h2 style="margin-bottom:8px">WR / WW / RW 依赖图（仅已提交事务）</h2>
+            <svg class="graph" id="graphSvg" viewBox="0 0 400 260"></svg>
+            <div class="legend">
+              <span class="l-wr">WR 写→读</span>
+              <span class="l-ww">WW 写→写</span>
+              <span class="l-rw">RW 读→后写（反依赖）</span>
+            </div>
+          </div>
+          <div class="panel" style="margin:0">
+            <h2 style="margin-bottom:8px">事务状态</h2>
+            <div class="status-row" id="statusBox"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  <section id="emptyHint" class="panel placeholder">
+    配置好脚本后点击「生成调度并推演」，三种隔离级别共用默认轮转调度、结果并排可比；
+    或填写自定义执行顺序后点击「对照推演」，与默认轮转逐侧对比。
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const TXN_COLORS = { T1: "var(--t1)", T2: "var(--t2)", T3: "var(--t3)" };
+const MODE_LABEL = {
+  RU: "Read Uncommitted（读未提交）",
+  RC: "Read Committed（读已提交）",
+  SI: "Snapshot Isolation（快照隔离）"
+};
+const MODE_RULE = {
+  RU: "每次读取取键上的最新写入（含其他事务未提交版本）。",
+  RC: "每次读取只取键上最新已提交版本；不读未提交数据，也不看自己未提交的写。",
+  SI: "读取基于 BEGIN 时的快照，自身写入优先；快照后同键被他人提交，则提交时整笔回滚（首提交者胜）。"
+};
+
+const EXAMPLES = [
+  {
+    name: "示例1 · 脏读",
+    desc: "T1 写入后回滚，T2 在 RU 下读到了随后作废的值；RC/SI 不受影响。",
+    initial: "x=0",
+    enableT3: false,
+    txns: [
+      "BEGIN\nWRITE x 10\nABORT",
+      "BEGIN\nREAD x\nCOMMIT"
+    ]
+  },
+  {
+    name: "示例2 · 丢失更新",
+    desc: "两事务同读 x=0 后分别写入并提交：RU/RC 均提交且依赖图成环；SI 下后提交者整笔回滚。",
+    initial: "x=0",
+    enableT3: false,
+    txns: [
+      "BEGIN\nREAD x\nWRITE x 10\nCOMMIT",
+      "BEGIN\nREAD x\nWRITE x 20\nCOMMIT"
+    ]
+  },
+  {
+    name: "示例3 · 写偏序",
+    desc: "T1 读 x 写 y，T2 读 y 写 x，互不覆盖却互相依赖：即使在 SI 下双双提交，RW 反依赖依然成环。",
+    initial: "x=10\ny=10",
+    enableT3: false,
+    txns: [
+      "BEGIN\nREAD x\nWRITE y 0\nCOMMIT",
+      "BEGIN\nREAD y\nWRITE x 0\nCOMMIT"
+    ]
+  },
+  {
+    name: "示例4 · 同键交错提交",
+    desc: "T1 先写 x=1 却晚于写 x=2 的 T2 提交，T3 在两次提交之后读 x：RC 按提交顺序读到 T1 的 1（而非编号更大的 T2 的 2），RU 取最新写入 2，SI 读 BEGIN 快照 0 且 T1 同键冲突整笔回滚。",
+    initial: "x=0\na=0\nb=0\nc=0",
+    enableT3: true,
+    txns: [
+      "BEGIN\nWRITE x 1\nREAD a\nCOMMIT",
+      "BEGIN\nWRITE x 2\nCOMMIT",
+      "BEGIN\nREAD b\nREAD c\nREAD x\nCOMMIT"
+    ]
+  }
+];
+
+const state = { data: null, cmp: null, view: "single", side: "custom", mode: "RU", idx: 0, timer: null };
+
+const $ = id => document.getElementById(id);
+
+function fmt(v) {
+  if (v === null || v === undefined) return "∅";
+  if (typeof v === "boolean") return v ? "true" : "false";
+  return String(v);
+}
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+// ---------------------------------------------------------------------------
+// 示例按钮
+// ---------------------------------------------------------------------------
+
+function initExamples() {
+  const row = $("examplesRow");
+  EXAMPLES.forEach((ex, i) => {
+    const b = document.createElement("button");
+    b.textContent = ex.name;
+    b.title = ex.desc;
+    b.onclick = () => loadExample(i);
+    row.appendChild(b);
+  });
+}
+
+function loadExample(i) {
+  const ex = EXAMPLES[i];
+  $("initial").value = ex.initial;
+  $("enableT3").checked = ex.enableT3;
+  $("t3box").style.display = ex.enableT3 ? "" : "none";
+  $("t1").value = ex.txns[0];
+  $("t2").value = ex.txns[1];
+  $("t3").value = ex.txns[2] || "";
+  hideError();
+  fillDefaultOrder();
+  run();
+}
+
+// ---------------------------------------------------------------------------
+// 请求
+// ---------------------------------------------------------------------------
+
+function collectTxns() {
+  const list = [
+    { name: "T1", text: $("t1").value },
+    { name: "T2", text: $("t2").value }
+  ];
+  if ($("enableT3").checked) list.push({ name: "T3", text: $("t3").value });
+  return list;
+}
+
+async function run() {
+  stopPlay();
+  const txns = collectTxns().map(t => t.text);
+  if (txns.some(t => !t.trim())) {
+    return showError("T1、T2（以及启用时的 T3）脚本都不能为空。");
+  }
+  let resp;
+  try {
+    resp = await fetch("/api/simulate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initial: $("initial").value, txns })
+    });
+  } catch (e) {
+    return showError("网络错误：" + e.message);
+  }
+  const data = await resp.json();
+  if (!resp.ok) {
+    return showError(data.detail || "推演失败");
+  }
+  hideError();
+  state.data = data;
+  state.cmp = null;
+  state.view = "single";
+  state.mode = "RU";
+  state.idx = 0;
+  $("emptyHint").style.display = "none";
+  $("resultSection").style.display = "";
+  $("comparePanel").style.display = "none";
+  $("sideTabs").style.display = "none";
+  renderTabs();
+  render();
+}
+
+// 与后端轮转调度一致：按事务顺序循环，每轮取各事务队头一条操作
+function fillDefaultOrder() {
+  const txns = collectTxns();
+  const remaining = txns.map(t => t.text.split("\n").filter(l => l.trim()).length);
+  const names = txns.map(t => t.name);
+  const alive = new Set(names.filter((_, i) => remaining[i] > 0));
+  const out = [];
+  while (alive.size) {
+    let progressed = false;
+    names.forEach((n, i) => {
+      if (!alive.has(n)) return;
+      if (remaining[i] > 0) {
+        out.push(n);
+        remaining[i]--;
+        progressed = true;
+        if (remaining[i] === 0) alive.delete(n);
+      }
+    });
+    if (!progressed) break;
+  }
+  $("orderInput").value = out.join(" ");
+}
+
+async function runCompare() {
+  stopPlay();
+  const txns = collectTxns().map(t => t.text);
+  if (txns.some(t => !t.trim())) {
+    return showError("T1、T2（以及启用时的 T3）脚本都不能为空。");
+  }
+  const order = $("orderInput").value.trim();
+  if (!order) {
+    return showError("请填写自定义执行顺序（由 T1/T2/T3 组成，需恰好覆盖各事务全部操作）。");
+  }
+  let resp;
+  try {
+    resp = await fetch("/api/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initial: $("initial").value, txns, order })
+    });
+  } catch (e) {
+    return showError("网络错误：" + e.message);
+  }
+  const data = await resp.json();
+  if (!resp.ok) {
+    clearCompare();  // 提示错误并清除页面旧对照
+    return showError(data.detail || "对照推演失败");
+  }
+  hideError();
+  state.cmp = data;
+  state.view = "compare";
+  state.side = "custom";
+  state.mode = "RU";
+  state.idx = 0;
+  $("emptyHint").style.display = "none";
+  $("resultSection").style.display = "";
+  $("comparePanel").style.display = "";
+  renderCompareSummary();
+  renderSideTabs();
+  renderTabs();
+  render();
+}
+
+function clearCompare() {
+  state.cmp = null;
+  $("comparePanel").style.display = "none";
+  $("sideTabs").style.display = "none";
+  if (state.view === "compare") {
+    state.view = "single";
+    if (state.data) {
+      state.idx = 0;
+      renderTabs();
+      render();
+    } else {
+      $("resultSection").style.display = "none";
+      $("emptyHint").style.display = "";
+    }
+  }
+}
+
+function showError(msg) {
+  const box = $("errorBox");
+  box.textContent = "⚠ " + msg;
+  box.style.display = "block";
+}
+function hideError() { $("errorBox").style.display = "none"; }
+
+// ---------------------------------------------------------------------------
+// 标签页与播放
+// ---------------------------------------------------------------------------
+
+function renderTabs() {
+  const tabs = $("tabs");
+  tabs.innerHTML = "";
+  const results = currentResults();
+  if (!results) return;
+  for (const m of ["RU", "RC", "SI"]) {
+    const g = results[m].graph;
+    const div = document.createElement("div");
+    div.className = "tab" + (m === state.mode ? " active" : "");
+    div.innerHTML = `${esc(MODE_LABEL[m])}` +
+      `<span class="verdict ${g.has_cycle ? "bad" : "ok"}">` +
+      `${g.has_cycle ? "环!" : "可串行化"}</span>`;
+    div.onclick = () => { stopPlay(); state.mode = m; renderTabs(); render(); };
+    tabs.appendChild(div);
+  }
+}
+
+// 对照视图下的两侧切换：默认轮转 / 自定义顺序
+function renderSideTabs() {
+  const el = $("sideTabs");
+  if (state.view !== "compare" || !state.cmp) {
+    el.style.display = "none";
+    el.innerHTML = "";
+    return;
+  }
+  el.style.display = "flex";
+  el.innerHTML = "";
+  [["default", "默认轮转顺序"], ["custom", "自定义顺序"]].forEach(([side, label]) => {
+    const div = document.createElement("div");
+    div.className = "tab" + (state.side === side ? " active" : "");
+    div.textContent = label;
+    div.onclick = () => { stopPlay(); state.side = side; renderSideTabs(); renderTabs(); render(); };
+    el.appendChild(div);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 对照摘要
+// ---------------------------------------------------------------------------
+
+function fieldValLabel(field, v) {
+  if (field === "read_source") return sourceLabel(v);
+  if (field === "txn_status_after") return statusLabel(v);
+  if (field === "read_writer") return v === "INIT" ? "初始数据" : (v == null ? "∅" : esc(v));
+  return esc(fmt(v));
+}
+
+function diffLine(d) {
+  const opText = d.op === "READ" ? `READ ${d.key}` : d.op;
+  const fields = d.fields.map(f =>
+    `${f.label} <span class="f">${fieldValLabel(f.field, f.default)}</span> → ` +
+    `<span class="f">${fieldValLabel(f.field, f.custom)}</span>`
+  ).join("；");
+  return `${d.txn} 第 ${d.op_index} 条 ${esc(opText)}` +
+    `（默认第 ${d.default_seq} 步 ↔ 自定义第 ${d.custom_seq} 步）：${fields}`;
+}
+
+function sideSummaryHtml(title, res) {
+  const g = res.graph;
+  const cyc = g.has_cycle
+    ? `<div style="color:var(--red)">⚠ 依赖图成环：${g.cycles.map(c => esc(c.label)).join("；")}</div>`
+    : `<div style="color:var(--green)">✔ 依赖图无环</div>`;
+  const dirty = res.dirty_reads.length
+    ? `<div style="color:var(--amber)">⚠ 脏读清单 ${res.dirty_reads.length} 条：</div>` +
+      `<ul>${res.dirty_reads.map(d => `<li>第 ${d.read_seq} 步：${esc(d.detail)}</li>`).join("")}</ul>`
+    : `<div style="color:var(--muted)">脏读清单：无</div>`;
+  return `<div class="cmp-side"><div class="st">${title}</div>${cyc}${dirty}</div>`;
+}
+
+function renderCompareSummary() {
+  const box = $("compareSummary");
+  if (!state.cmp) { box.innerHTML = ""; return; }
+  $("cmpOrderText").textContent = state.cmp.order.join(" ");
+  let html = "";
+  for (const m of ["RU", "RC", "SI"]) {
+    const c = state.cmp.compare[m];
+    let diffHtml;
+    if (c.identical) {
+      diffHtml = `<div class="cmp-diff same">✔ 无差异：READ / COMMIT / ABORT 按「事务名 + 事务内操作序号」对齐后，` +
+        `两侧读值、来源类型、写入者与结束状态完全一致。</div>`;
+    } else {
+      diffHtml = `<div class="cmp-diff diff"><strong>首次差异</strong>（依默认轮转悠序）：${diffLine(c.first_diff)}`;
+      if (c.diff_count > 1) {
+        diffHtml += `<details class="cmp-all"><summary>共 ${c.diff_count} 处差异，展开查看全部</summary><ul>` +
+          c.diffs.map(d => `<li>${diffLine(d)}</li>`).join("") + `</ul></details>`;
+      } else {
+        diffHtml += `<div style="margin-top:4px;font-size:11px;opacity:.8">共 1 处差异。</div>`;
+      }
+      diffHtml += `</div>`;
+    }
+    html += `<div class="cmp-card"><h3>${esc(MODE_LABEL[m])}` +
+      `<span class="verdict ${c.identical ? "ok" : "bad"}">${c.identical ? "无差异" : `差异 ${c.diff_count} 处`}</span></h3>` +
+      diffHtml +
+      `<div class="cmp-sides">` +
+      sideSummaryHtml("默认轮转", state.cmp.sides.default.results[m]) +
+      sideSummaryHtml("自定义顺序", state.cmp.sides.custom.results[m]) +
+      `</div></div>`;
+  }
+  box.innerHTML = html;
+}
+
+function stopPlay() {
+  if (state.timer) { clearInterval(state.timer); state.timer = null; $("playBtn").textContent = "⏩ 自动播放"; }
+}
+function togglePlay() {
+  if (state.timer) { stopPlay(); return; }
+  const n = result().steps.length;
+  if (state.idx >= n - 1) state.idx = 0;
+  $("playBtn").textContent = "⏸ 暂停";
+  state.timer = setInterval(() => {
+    if (state.idx >= n - 1) { stopPlay(); return; }
+    state.idx++;
+    render();
+  }, 950);
+}
+
+// ---------------------------------------------------------------------------
+// 渲染主体
+// ---------------------------------------------------------------------------
+
+function currentResults() {
+  if (state.view === "compare" && state.cmp) return state.cmp.sides[state.side].results;
+  return state.data ? state.data.results : null;
+}
+
+function result() { return currentResults()[state.mode]; }
+
+// 对照视图下当前侧首次差异所在的步号（无差异或单跑视图时为 null）
+function firstDiffSeq() {
+  if (state.view !== "compare" || !state.cmp) return null;
+  const fd = state.cmp.compare[state.mode].first_diff;
+  if (!fd) return null;
+  return state.side === "default" ? fd.default_seq : fd.custom_seq;
+}
+
+function render() {
+  if (!currentResults()) return;
+  const r = result();
+  const n = r.steps.length;
+  state.idx = Math.max(0, Math.min(state.idx, n - 1));
+  const sideTag = state.view === "compare" && state.cmp
+    ? `【${state.side === "default" ? "默认轮转" : "自定义顺序"}】` : "";
+  $("posText").textContent = `${sideTag}第 ${state.idx + 1} / ${n} 步 · ${MODE_RULE[state.mode]}`;
+  renderChips(r);
+  renderStep(r.steps[state.idx]);
+  renderChains(r.steps[state.idx]);
+  renderStatus(r.steps[state.idx]);
+  renderAlerts(r);
+  renderGraph(r.graph);
+}
+
+function opShort(step) {
+  if (step.op === "READ") return `READ ${step.key}`;
+  if (step.op === "WRITE") return `WRITE ${step.key} ${fmt(step.value)}`;
+  return step.op;
+}
+
+function renderChips(r) {
+  const box = $("chips");
+  box.innerHTML = "";
+  const fdSeq = firstDiffSeq();
+  r.steps.forEach((s, i) => {
+    const c = document.createElement("div");
+    c.className = "chip" + (i < state.idx ? " done" : "") +
+      (i === state.idx ? " current" : "") +
+      (s.in_cycle ? " cycle" : "") +
+      (s.dirty_candidate ? " dirty" : "") +
+      (s.seq === fdSeq ? " firstdiff" : "");
+    c.innerHTML = `<span class="cseq">${s.seq}</span>${s.txn} ${esc(opShort(s))}`;
+    c.onclick = () => { stopPlay(); state.idx = i; render(); };
+    box.appendChild(c);
+  });
+  box.children[state.idx]?.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" });
+}
+
+function txnBadge(name) {
+  return `<span class="txn-badge" style="background:rgba(255,255,255,.07);border:1px solid ${TXN_COLORS[name] || "#888"};color:${TXN_COLORS[name] || "#ccc"}">${name}</span>`;
+}
+
+function renderStep(step) {
+  const card = $("stepCard");
+  card.className = "step-card" + (step.in_cycle ? " cycle" : "");
+  let tags = "";
+  if (step.dirty_candidate) tags += `<span class="tag dirty">疑似脏读</span>`;
+  if (step.in_cycle) (step.cycle_tags || []).forEach(t => tags += `<span class="tag cycle">${esc(t)}</span>`);
+  if (step.op === "COMMIT" && step.txn_status_after === "aborted")
+    tags += `<span class="tag cycle">SI 回滚</span>`;
+  if (step.seq === firstDiffSeq())
+    tags += `<span class="tag cycle">对照首次差异</span>`;
+
+  let inner = `
+    <div class="step-top">
+      <span class="seq-badge">#${step.seq}</span>
+      ${txnBadge(step.txn)}
+      <span class="op-text">${esc(opShort(step))}</span>
+      ${tags}
+    </div>
+    <p class="step-info">${esc(step.info)}</p>`;
+
+  if (step.op === "READ" && step.read_source !== "missing") {
+    inner += `<div class="kv-mini">
+      <span class="k">读到版本</span><span class="v">v${step.read_vid}</span>
+      <span class="k">读值</span><span class="v">${esc(fmt(step.read_value))}</span>
+      <span class="k">写入者</span><span class="v">${step.read_writer === "INIT" ? "初始数据" : esc(step.read_writer)}</span>
+      <span class="k">来源类型</span><span class="v">${sourceLabel(step.read_source)}</span>
+    </div>`;
+  } else if (step.op === "READ") {
+    inner += `<div class="kv-mini"><span class="k">读值</span><span class="v">∅（键 ${esc(step.key)} 不存在于可读范围）</span></div>`;
+  }
+  if (step.op === "WRITE") {
+    inner += `<div class="kv-mini">
+      <span class="k">新版本</span><span class="v">v${step.new_vid}（未提交）</span>
+      <span class="k">写入值</span><span class="v">${esc(fmt(step.value))}</span>
+    </div>`;
+  }
+  if (step.snapshot && Object.keys(step.snapshot).length >= 0 && state.mode === "SI" && step.op === "BEGIN") {
+    const items = Object.entries(step.snapshot);
+    inner += `<div class="snap-box"><div class="snap-title">BEGIN 快照（之后他人的提交对本事务不可见）</div>
+      <div class="kv-mini">${items.length
+        ? items.map(([k, v]) => `<span class="k">${esc(k)}</span><span class="v">${esc(fmt(v.value))} <span style="color:var(--muted)">(v${v.vid}, ${v.writer === "INIT" ? "初始" : esc(v.writer)})</span></span>`).join("")
+        : `<span class="k">快照</span><span class="v">空</span>`}</div></div>`;
+  }
+  card.innerHTML = inner;
+}
+
+function sourceLabel(src) {
+  return {
+    initial: "初始值",
+    committed: "最新已提交版本",
+    dirty: "其他事务未提交的写入（脏读）",
+    snapshot: "BEGIN 快照",
+    own: "本事务自身写入",
+    missing: "无此键"
+  }[src] || src;
+}
+
+function renderChains(step) {
+  const box = $("chainsBox");
+  const chains = step.chains_after || {};
+  const keys = Object.keys(chains);
+  if (!keys.length) { box.innerHTML = ""; return; }
+  let html = `<h2 style="font-size:14px;margin:18px 0 10px;color:#cdd9ee">版本链（旧 → 新）</h2>`;
+  for (const key of keys) {
+    html += `<div class="chain-block"><div class="chain-key">${esc(key)}</div><div class="chain-row">`;
+    chains[key].forEach((v, i) => {
+      if (i > 0) html += `<span class="arrow-right">─→</span>`;
+      let hl = "", ring = "";
+      if (v.vid === step.read_vid) { hl = " hl-read"; ring = `<span class="ring-label read">读</span>`; }
+      if (v.vid === step.new_vid) { hl = " hl-write"; ring = `<span class="ring-label write">写</span>`; }
+      if (v.vid === step.conflict_vid) { hl = " hl-conflict"; ring = `<span class="ring-label conflict">冲突</span>`; }
+      const kindLabel = { initial: "初始", uncommitted: "未提交", committed: "已提交", aborted: "已回滚" }[v.kind];
+      html += `<div class="vbadge ${v.kind}${hl}">
+        ${ring}
+        <div class="vid">v${v.vid}</div>
+        <div class="vval">${esc(fmt(v.value))}</div>
+        <div class="vmeta">${v.writer === "INIT" ? "INIT" : esc(v.writer)} · ${kindLabel}</div>
+      </div>`;
+    });
+    html += `</div></div>`;
+  }
+  box.innerHTML = html;
+}
+
+function renderStatus(step) {
+  const box = $("statusBox");
+  box.innerHTML = "";
+  for (const [name, st] of Object.entries(step.txns_after || {})) {
+    const pill = document.createElement("span");
+    pill.className = `status-pill ${st.status}`;
+    let tail = "";
+    if (st.commit_seq != null) tail = ` @${st.commit_seq}提交`;
+    else if (st.abort_seq != null) tail = ` @${st.abort_seq}回滚`;
+    else if (st.begin_seq != null) tail = ` @${st.begin_seq}开始`;
+    pill.style.borderColor = (st.status === "active" || st.status === "committed")
+      ? (name === "T1" ? "var(--t1)" : name === "T2" ? "var(--t2)" : "var(--t3)") : undefined;
+    pill.innerHTML = `${name}：${statusLabel(st.status)}<span style="opacity:.7">${tail}</span>`;
+    box.appendChild(pill);
+  }
+}
+
+function statusLabel(s) {
+  return { pending: "未开始", active: "活跃中", committed: "已提交", aborted: "已回滚" }[s] || s;
+}
+
+function renderAlerts(r) {
+  const box = $("alertsBox");
+  let html = "";
+  const g = r.graph;
+  if (g.has_cycle) {
+    html += `<div class="alert cycle"><strong>⚠ 依赖图存在环，该调度在此隔离级别下不可串行化</strong>
+      <ul>${g.cycles.map(c => `<li>${esc(c.label)}</li>`).join("")}</ul>
+      <div style="margin-top:6px">环上的读写操作已在步骤序列与下方图中红色高亮。</div></div>`;
+  } else {
+    html += `<div class="alert ok">✔ 依赖图无环：该调度在此隔离级别下可串行化。</div>`;
+  }
+  if (r.dirty_reads.length) {
+    html += `<div class="alert dirty"><strong>⚠ 脏读清单（读到随后被 ABORT 的未提交数据）</strong>
+      <ul>${r.dirty_reads.map(d => `<li>第 ${d.read_seq} 步：${esc(d.detail)}</li>`).join("")}</ul></div>`;
+  } else if (state.mode === "RU") {
+    html += `<div class="alert ok" style="font-size:12px">本调度中没有读到“后来回滚”的数据。</div>`;
+  }
+  box.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// SVG 依赖图
+// ---------------------------------------------------------------------------
+
+function renderGraph(graph) {
+  const svg = $("graphSvg");
+  const W = 400, H = 260, cx = W / 2, cy = H / 2 + 6, R = 88;
+  const all = graph.nodes_all;
+  const pos = {};
+  all.forEach((n, i) => {
+    const ang = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(all.length, 1);
+    pos[n.name] = [cx + R * Math.cos(ang), cy + R * Math.sin(ang)];
+  });
+
+  // 统计同方向边数以偏移曲率
+  const pairCount = {}, pairIndex = {};
+  graph.edges.forEach(e => {
+    const key = `${e.from}|${e.to}`;
+    pairCount[key] = (pairCount[key] || 0) + 1;
+  });
+  const defs = [`<marker id="arr" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#93a1b8"/></marker>`];
+  ["wr", "ww", "rw"].forEach(k => {
+    const color = { wr: "var(--green)", ww: "var(--amber)", rw: "var(--purple)" }[k];
+    defs.push(`<marker id="arr-${k}" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="${color}"/></marker>`);
+  });
+  let body = "";
+
+  graph.edges.forEach(e => {
+    const [x1, y1] = pos[e.from], [x2, y2] = pos[e.to];
+    const key = `${e.from}|${e.to}`;
+    const idx = pairIndex[key] = (pairIndex[key] || 0);
+    pairIndex[key]++;
+    const total = pairCount[key];
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len;
+    const gap = 22;
+    const sx = x1 + (dx / len) * gap, sy = y1 + (dy / len) * gap;
+    const tx = x2 - (dx / len) * gap, ty = y2 - (dy / len) * gap;
+    const bend = total === 1 ? 18 : 10 + idx * 16;
+    const mx = (sx + tx) / 2 + nx * bend, my = (sy + ty) / 2 + ny * bend;
+    const color = { WR: "var(--green)", WW: "var(--amber)", RW: "var(--purple)" }[e.kind];
+    const width = e.in_cycle ? 3.2 : 2;
+    const dash = e.kind === "RW" ? "6,4" : "none";
+    const cls = e.in_cycle ? 'style="filter:drop-shadow(0 0 5px rgba(239,107,107,.9))"' : "";
+    body += `<path d="M${sx},${sy} Q${mx},${my} ${tx},${ty}" fill="none"
+      stroke="${color}" stroke-width="${width}" stroke-dasharray="${dash}"
+      marker-end="url(#arr-${e.kind.toLowerCase()})" ${cls}/>`;
+    body += `<text class="edge-label" x="${mx}" y="${my}">${e.kind}:${esc(e.key)}</text>`;
+  });
+
+  const cycleNodes = new Set();
+  graph.cycles.forEach(c => c.nodes.forEach(n => cycleNodes.add(n)));
+
+  all.forEach(n => {
+    const [x, y] = pos[n.name];
+    const committed = n.status === "committed";
+    const fill = committed
+      ? (n.name === "T1" ? "rgba(91,140,255,.25)" : n.name === "T2" ? "rgba(242,166,90,.25)" : "rgba(84,192,142,.25)")
+      : "rgba(120,120,130,.12)";
+    const stroke = cycleNodes.has(n.name) ? "var(--red)"
+      : (n.name === "T1" ? "var(--t1)" : n.name === "T2" ? "var(--t2)" : "var(--t3)");
+    body += `<circle cx="${x}" cy="${y}" r="20" fill="${fill}" stroke="${stroke}"
+      stroke-width="${cycleNodes.has(n.name) ? 3 : 1.8}" ${committed ? "" : 'stroke-dasharray="4,3"'} />`;
+    body += `<text class="graph-node-text" x="${x}" y="${y - 3}">${n.name}</text>`;
+    body += `<text class="graph-sub" x="${x}" y="${y + 11}">${committed ? "已提交" : "已回滚"}</text>`;
+  });
+
+  svg.innerHTML = `<defs>${defs.join("")}</defs>${body}`;
+}
+
+// ---------------------------------------------------------------------------
+// 绑定
+// ---------------------------------------------------------------------------
+
+function bind() {
+  $("runBtn").onclick = run;
+  $("compareBtn").onclick = runCompare;
+  $("fillOrderBtn").onclick = fillDefaultOrder;
+  $("clearOrderBtn").onclick = () => { $("orderInput").value = ""; };
+  document.querySelectorAll(".order-add").forEach(b => {
+    b.onclick = () => {
+      const el = $("orderInput");
+      el.value = (el.value.trim() ? el.value.trim() + " " : "") + b.dataset.name;
+    };
+  });
+  $("enableT3").onchange = e => { $("t3box").style.display = e.target.checked ? "" : "none"; };
+  $("prevBtn").onclick = () => { stopPlay(); state.idx--; render(); };
+  $("nextBtn").onclick = () => { stopPlay(); state.idx++; render(); };
+  $("resetBtn").onclick = () => { stopPlay(); state.idx = 0; render(); };
+  $("playBtn").onclick = togglePlay;
+  document.addEventListener("keydown", e => {
+    if (!currentResults() || e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
+    if (e.key === "ArrowLeft") { stopPlay(); state.idx--; render(); }
+    if (e.key === "ArrowRight") { stopPlay(); state.idx++; render(); }
+  });
+}
+
+initExamples();
+bind();
+</script>
+</body>
+</html>

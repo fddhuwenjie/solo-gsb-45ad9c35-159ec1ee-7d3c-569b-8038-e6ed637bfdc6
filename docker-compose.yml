@@ -1,0 +1,7 @@
+services:
+  txn-playground:
+    build: .
+    container_name: txn-interleaving
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
