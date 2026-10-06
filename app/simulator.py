@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -1005,4 +1006,529 @@ def run_compare(initial_text: str, txn_texts: List[str], order_raw: Any) -> dict
             "custom": {"label": "自定义顺序", "results": custom_results},
         },
         "compare": compare,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 严格两阶段锁（Strict Two-Phase Locking, S2PL / 2PL）
+#
+# 与 RU/RC/SI 的“一次性排好调度再执行”不同，S2PL 下锁冲突会改变执行顺序：
+# T1～T3 轮流尝试各自队头操作，READ 申请共享锁（S），WRITE 申请排他锁（X），
+# 已持 S 锁可升级为 X；所有锁持有到 COMMIT / ABORT 才释放（严格 2PL）。
+# 冲突时记录持锁阻塞者、保留队头并转试其他事务；锁释放后下一轮重试。
+# 等待关系成环（死锁）时回滚环内编号最大的事务：撤销写入、跳过剩余操作、
+# 释放全部锁；后续读取永远见不到被撤销的版本。
+#
+# 读规则：先读自己的写入，否则取按提交顺序（cseq）最新的已提交版本。
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _LockState:
+    key: str
+    mode: str = "S"                      # S | X
+    holders: List[str] = field(default_factory=list)   # X 模式下至多 1 个
+
+
+def _txn_number(name: str) -> Tuple[int, str]:
+    """事务编号排序键：名字形如 T3 → (3, 'T3')；无法解析数字时退化为词序。"""
+    m = re.search(r"\d+", name)
+    return (int(m.group()) if m else -1, name)
+
+
+def _can_grant(ls: _LockState, tname: str, mode: str) -> Tuple[bool, List[str]]:
+    """返回 (能否授予, 阻塞者列表)。自己已持的锁不阻塞自己（含 S→X 升级）。"""
+    if not ls.holders:
+        return True, []
+    if mode == "S":
+        if ls.mode == "S":
+            return True, []              # S 与 S 兼容，多读并发
+        if ls.holders == [tname]:
+            return True, []              # 自己持 X，读无需再加
+        return False, list(ls.holders)   # 他人持 X
+    # mode == X
+    if ls.mode == "X" and ls.holders == [tname]:
+        return True, []                  # 已持 X
+    blockers = [h for h in ls.holders if h != tname]
+    if blockers:
+        return False, blockers           # 含 S→X 升级时被其他 S 持有者阻塞
+    return True, []                      # 自己持 S 且无他人持锁：可升级
+
+
+def _grant_lock(locks: Dict[str, _LockState], tname: str, key: str, mode: str) -> None:
+    ls = locks.get(key)
+    if ls is None:
+        ls = _LockState(key=key)
+        locks[key] = ls
+    if mode == "S":
+        ls.mode = "S"
+        if tname not in ls.holders:
+            ls.holders.append(tname)
+        ls.holders.sort(key=_txn_number)
+    else:  # X（含 S → X 升级）
+        ls.holders = [tname]
+        ls.mode = "X"
+
+
+def _release_all(locks: Dict[str, _LockState], tname: str) -> List[str]:
+    """释放事务持有的全部锁；返回真正解锁的键（最后一个持锁者离开）。"""
+    fully_released: List[str] = []
+    for key, ls in list(locks.items()):
+        if tname in ls.holders:
+            ls.holders.remove(tname)
+            if not ls.holders:
+                del locks[key]
+                fully_released.append(key)
+    return fully_released
+
+
+def _locks_snapshot(locks: Dict[str, _LockState]) -> "OrderedDict[str, dict]":
+    out: "OrderedDict[str, dict]" = OrderedDict()
+    for key in sorted(locks.keys()):
+        ls = locks[key]
+        out[key] = {"mode": ls.mode, "holders": list(ls.holders)}
+    return out
+
+
+def _wait_snapshot(waiting: Dict[str, Dict[str, str]]) -> List[dict]:
+    edges: List[dict] = []
+    for waiter in sorted(waiting.keys()):
+        for blocker in sorted(waiting[waiter].keys()):
+            edges.append({"from": waiter, "to": blocker})
+    return edges
+
+
+def _find_wait_cycle(waiting: Dict[str, Dict[str, str]],
+                     start: str) -> Optional[List[str]]:
+    """从 start 出发在等待图上找一个环，返回不重复的节点列表（成环顺序）。"""
+    path: List[str] = []
+    onpath = set()
+
+    def dfs(u: str) -> Optional[List[str]]:
+        path.append(u)
+        onpath.add(u)
+        for v in sorted(waiting.get(u, {}).keys(), key=_txn_number):
+            if v == start and len(path) >= 2:
+                return list(path)
+            if v in onpath:
+                continue
+            found = dfs(v)
+            if found:
+                return found
+        path.pop()
+        onpath.discard(u)
+        return None
+
+    return dfs(start)
+
+
+def simulate_twopl(initial: "OrderedDict[str, Any]",
+                   txn_scripts: List[Tuple[str, str]]) -> dict:
+    """严格两阶段锁推演。
+
+    轮次（round）：每轮按 T1～T3 顺序，让每个未结束事务尝试一次其队头操作。
+    被阻塞的事务不推进 pc、保留队头；锁释放后下一轮自动重试。
+    每次尝试（执行 / 等待 / 死锁回滚）都是 steps 中的一步。
+    """
+    txns: Dict[str, Txn] = OrderedDict()
+    for name, text in txn_scripts:
+        txns[name] = Txn(name=name, ops=parse_txn(name, text))
+    txn_list = list(txns.values())
+
+    # 版本链：初始版本
+    chains: Dict[str, List[Version]] = OrderedDict()
+    next_vid = 1
+    for key, value in initial.items():
+        chains[key] = [_initial_version(next_vid, key, value)]
+        next_vid += 1
+
+    locks: Dict[str, _LockState] = {}
+    # waiter -> {blocker: key}
+    waiting: Dict[str, Dict[str, str]] = {}
+    # 事务当前持有/涉及的键（用于状态展示）
+    txn_locks: Dict[str, List[str]] = {t.name: [] for t in txn_list}
+
+    steps: List[dict] = []
+    deadlocks: List[dict] = []
+    seq = 0
+    round_no = 0
+    MAX_ROUNDS = 10000
+
+    def snapshot_step(extra: dict, t: Txn) -> dict:
+        step: Dict[str, Any] = {
+            "seq": seq,
+            "round": round_no,
+            "txn": t.name,
+            "op": None,
+            "key": None,
+            "value": None,
+            "kind": extra.get("kind", ""),
+            "read_vid": None,
+            "read_value": None,
+            "read_source": None,   # initial | committed | own
+            "read_writer": None,
+            "read_wseq": None,
+            "new_vid": None,
+            "lock_mode": None,     # S | X | upgrade
+            "lock_action": None,   # acquire | upgrade | wait | release
+            "blockers": [],
+            "blocker_key": None,
+            "wait_edges_before": None,
+            "cycle": None,
+            "victim": None,
+            "undone_vids": [],
+            "skipped_ops": [],
+            "txn_status_before": t.status,
+            "txn_status_after": t.status,
+            "info": extra.get("info", ""),
+            "chains_after": None,
+            "locks_after": None,
+            "wait_edges_after": None,
+            "txns_after": None,
+        }
+        step.update(extra)
+        steps.append(step)
+        return step
+
+    def finish_snapshot(step: dict) -> None:
+        step["chains_after"] = _chain_dicts(chains)
+        step["locks_after"] = _locks_snapshot(locks)
+        step["wait_edges_after"] = _wait_snapshot(waiting)
+        step["txns_after"] = {
+            x.name: {
+                "status": x.status,
+                "begin_seq": x.begin_seq,
+                "commit_seq": x.commit_seq,
+                "abort_seq": x.abort_seq,
+                "locks": [k for k in txn_locks[x.name] if k in locks],
+            }
+            for x in txn_list
+        }
+
+    def refresh_waiters() -> None:
+        """锁释放后重算每个等待者的阻塞关系（锁已可获取则删掉等待边）。
+
+        持锁者集合只会缩小，重算只会删边不会加边；新边只诞生于阻塞尝试，
+        那时会立即做环检测。
+        """
+        for wname in list(waiting.keys()):
+            t = txns[wname]
+            if t.status != "active" or t.pc >= len(t.ops):
+                waiting.pop(wname, None)
+                continue
+            op, key, _value = t.ops[t.pc]
+            if op not in ("READ", "WRITE"):
+                waiting.pop(wname, None)
+                continue
+            mode = "S" if op == "READ" else "X"
+            ok, blockers = _can_grant(locks[key], wname, mode) if key in locks else (True, [])
+            if ok:
+                waiting.pop(wname, None)
+            else:
+                waiting[wname] = {b: key for b in blockers}
+
+    while any(t.status != "committed" and t.status != "aborted"
+              for t in txn_list):
+        round_no += 1
+        if round_no > MAX_ROUNDS:
+            raise SimError("S2PL 推演超过最大轮次（可能存在实现层面的活锁）")
+        events = 0
+
+        for t in list(txn_list):
+            if t.status in ("committed", "aborted"):
+                continue
+            if t.pc >= len(t.ops):
+                # 未标结束却没有剩余操作（防御性）：直接按提交处理不应发生
+                continue
+
+            op, key, value = t.ops[t.pc]
+            seq += 1
+
+            if op == "BEGIN":
+                t.pc += 1
+                t.status = "active"
+                t.begin_seq = seq
+                events += 1
+                st = snapshot_step({
+                    "kind": "begin", "op": "BEGIN",
+                    "info": f"{t.name} 开始（严格两阶段锁：读取 S 锁、写取 X 锁，锁持有到 COMMIT / ABORT）",
+                }, t)
+                st["txn_status_after"] = "active"
+                finish_snapshot(st)
+                continue
+
+            if op in ("COMMIT", "ABORT"):
+                t.pc += 1
+                events += 1
+                released = _release_all(locks, t.name)
+                txn_locks[t.name] = []
+                undone: List[Version] = []
+                if op == "COMMIT":
+                    t.status = "committed"
+                    t.commit_seq = seq
+                    for wkey, wseq in t.writes:
+                        for v in chains[wkey]:
+                            if v.wseq == wseq:
+                                v.kind = "committed"
+                                v.cseq = seq
+                    info = (f"{t.name} 提交：{len(t.writes)} 个写入转为已提交版本，"
+                            f"释放全部 {len(released)} 把锁"
+                            + (f"（键 {'、'.join(sorted(released))}）" if released else ""))
+                else:
+                    t.status = "aborted"
+                    t.abort_seq = seq
+                    for wkey, wseq in t.writes:
+                        for v in chains[wkey]:
+                            if v.wseq == wseq and v.kind != "aborted":
+                                v.kind = "aborted"
+                                undone.append(v)
+                    info = (f"{t.name} 主动回滚：{len(undone)} 个写入作废，"
+                            f"释放全部 {len(released)} 把锁"
+                            + (f"（键 {'、'.join(sorted(released))}）" if released else ""))
+                st = snapshot_step({
+                    "kind": "commit" if op == "COMMIT" else "abort",
+                    "op": op,
+                    "lock_action": "release",
+                    "undone_vids": [v.vid for v in undone],
+                    "info": info,
+                }, t)
+                st["txn_status_after"] = t.status
+                finish_snapshot(st)
+                # 释放锁后重算等待关系
+                edges_before = _wait_snapshot(waiting)
+                refresh_waiters()
+                st["wait_edges_after"] = _wait_snapshot(waiting)
+                continue
+
+            # READ / WRITE：申请锁
+            assert key is not None
+            chains.setdefault(key, [])
+            mode = "S" if op == "READ" else "X"
+            ls = locks.get(key)
+            own_s = ls is not None and t.name in ls.holders and ls.mode == "S"
+            own_x = ls is not None and ls.mode == "X" and t.name in ls.holders
+            ok, blockers = _can_grant(ls, t.name, mode) if ls is not None else (True, [])
+
+            edges_before = _wait_snapshot(waiting)
+
+            if not ok:
+                # 阻塞：保留队头（pc 不动），登记等待边，检查死锁环
+                waiting.setdefault(t.name, {})
+                for b in blockers:
+                    waiting[t.name][b] = key
+                events += 1
+                cycle = _find_wait_cycle(waiting, t.name)
+                extra: Dict[str, Any] = {
+                    "kind": "wait", "op": op, "key": key, "value": value,
+                    "lock_mode": ("upgrade" if own_s and mode == "X" else mode),
+                    "lock_action": "wait",
+                    "blockers": sorted(blockers, key=_txn_number),
+                    "blocker_key": key,
+                    "wait_edges_before": edges_before,
+                    "info": (
+                        f"{t.name} 申请 {('S→X 升级' if own_s and mode == 'X' else mode + ' 锁')}"
+                        f"被阻塞：键 {key} 被 {'、'.join(sorted(blockers, key=_txn_number))} "
+                        f"持锁；队头 {('READ ' + key) if op == 'READ' else ('WRITE ' + key + ' ' + _fmt(value))} 保留，转试其他事务"
+                    ),
+                }
+                st = snapshot_step(extra, t)
+                if cycle is not None:
+                    # 死锁：回滚环内编号最大的事务
+                    victim_name = max(cycle, key=_txn_number)
+                    victim = txns[victim_name]
+                    # 1) 撤销写入
+                    undone_v: List[Version] = []
+                    for wkey, wseq in victim.writes:
+                        for v in chains[wkey]:
+                            if v.wseq == wseq and v.kind != "aborted":
+                                v.kind = "aborted"
+                                undone_v.append(v)
+                    # 2) 跳过剩余操作
+                    skipped = [
+                        f"READ {k}" if o == "READ" else
+                        (f"WRITE {k} {_fmt(val)}" if o == "WRITE" else o)
+                        for (o, k, val) in victim.ops[victim.pc:]
+                    ]
+                    victim.pc = len(victim.ops)
+                    # 3) 释放锁
+                    released = _release_all(locks, victim.name)
+                    txn_locks[victim.name] = []
+                    victim.status = "aborted"
+                    victim.abort_seq = seq
+                    waiting.pop(victim_name, None)
+                    # 环上其它事务等待这个 victim 的边全部解除
+                    for other in waiting.values():
+                        other.pop(victim_name, None)
+                    # 重算全部等待关系（拿到锁的等待者边消失）
+                    refresh_waiters()
+                    dl_entry = {
+                        "seq": seq,
+                        "cycle": list(cycle),
+                        "cycle_label": " → ".join(list(cycle) + [cycle[0]]),
+                        "victim": victim_name,
+                        "undone_vids": [v.vid for v in undone_v],
+                        "released_keys": sorted(released),
+                        "skipped_ops": skipped,
+                        "detail": (
+                            f"等待关系成环 {' → '.join(list(cycle) + [cycle[0]])}，"
+                            f"回滚环内编号最大的 {victim_name}："
+                            f"撤销 {len(undone_v)} 个写入"
+                            + (f"（v{', v'.join(str(v.vid) for v in undone_v)}）" if undone_v else "")
+                            + f"，跳过 {len(skipped)} 条剩余操作，释放 {len(released)} 把锁"
+                        ),
+                    }
+                    deadlocks.append(dl_entry)
+                    st["kind"] = "deadlock"
+                    st["cycle"] = list(cycle)
+                    st["victim"] = victim_name
+                    st["undone_vids"] = [v.vid for v in undone_v]
+                    st["skipped_ops"] = skipped
+                    if victim_name == t.name:
+                        st["info"] = (
+                            f"{t.name} 等待 {'、'.join(sorted(blockers, key=_txn_number))} 后等待图成环："
+                            + " → ".join(list(cycle) + [cycle[0]])
+                            + f"；本事务正是环内编号最大者，回滚 {victim_name}："
+                            f"撤销其 {len(undone_v)} 个写入、跳过剩余 {len(skipped)} 条操作并释放全部锁"
+                        )
+                    else:
+                        st["info"] = (
+                            f"{t.name} 等待 {'、'.join(sorted(blockers, key=_txn_number))} 后等待图成环："
+                            + " → ".join(list(cycle) + [cycle[0]])
+                            + f"；回滚环内编号最大的 {victim_name}，"
+                            f"撤销其 {len(undone_v)} 个写入、跳过剩余 {len(skipped)} 条操作并释放锁，"
+                            f"{t.name} 的队头操作下一轮重试"
+                        )
+                finish_snapshot(st)
+                if cycle is not None:
+                    # 用回滚后的真实状态覆盖
+                    st["txn_status_after"] = t.status
+                    st["wait_edges_after"] = _wait_snapshot(waiting)
+                continue
+
+            # 授予锁并执行
+            is_upgrade = own_s and mode == "X"
+            _grant_lock(locks, t.name, key, mode)
+            if key not in txn_locks[t.name]:
+                txn_locks[t.name].append(key)
+            t.pc += 1
+            events += 1
+
+            if op == "READ":
+                # 自己的写入优先；否则按提交顺序取最新已提交版本
+                chosen = _own_latest(t, chains, key)
+                source = "own"
+                if chosen is None:
+                    chosen = _rc_latest(chains, key)
+                    source = "missing" if chosen is None else (
+                        "initial" if chosen.kind == "initial" else "committed")
+                t.reads.append((key, seq, chosen.vid if chosen else None))
+
+                if own_x:
+                    lock_desc = "已持 X 锁，直接读取"
+                    lock_mode_out = "X-reentrant"
+                    action = "reentrant"
+                elif own_s:
+                    lock_desc = "已持 S 锁，直接读取"
+                    lock_mode_out = "S-reentrant"
+                    action = "reentrant"
+                else:
+                    lock_desc = "获得 S 锁"
+                    lock_mode_out = "S"
+                    action = "acquire"
+                verb = "读到"
+                tail = ""
+                if source == "own":
+                    tail = (f"本事务自己的写入 v{chosen.vid}={_fmt(chosen.value)}（自身写入优先）")
+                elif source == "initial":
+                    tail = f"初始值 v{chosen.vid}={_fmt(chosen.value)}"
+                elif source == "committed":
+                    tail = (f"{chosen.writer} 已提交的版本 v{chosen.vid}={_fmt(chosen.value)}"
+                            f"（按提交顺序最新）")
+                else:
+                    verb = "键 "
+                    tail = f"{key} 尚无已提交版本，读得 ∅"
+                info = f"{t.name} {lock_desc}，{verb}{tail}"
+                st = snapshot_step({
+                    "kind": "read", "op": "READ", "key": key,
+                    "lock_mode": lock_mode_out,
+                    "lock_action": action,
+                    "read_source": source,
+                    "read_vid": chosen.vid if chosen else None,
+                    "read_value": chosen.value if chosen else None,
+                    "read_writer": chosen.writer if chosen else None,
+                    "read_wseq": chosen.wseq if chosen else None,
+                    "wait_edges_before": edges_before,
+                    "info": info,
+                }, t)
+                finish_snapshot(st)
+            else:  # WRITE
+                v = Version(vid=next_vid, key=key, value=value, kind="uncommitted",
+                            writer=t.name, wseq=seq)
+                next_vid += 1
+                chains[key].append(v)
+                t.writes.append((key, seq))
+                if is_upgrade:
+                    lock_desc = "将 S 锁升级为 X 锁"
+                elif own_x:
+                    lock_desc = "已持 X 锁"
+                else:
+                    lock_desc = "获得 X 锁"
+                st = snapshot_step({
+                    "kind": "write", "op": "WRITE", "key": key, "value": value,
+                    "new_vid": v.vid,
+                    "lock_mode": ("upgrade" if is_upgrade else ("X-reentrant" if own_x else "X")),
+                    "lock_action": ("upgrade" if is_upgrade else
+                                    ("reentrant" if own_x else "acquire")),
+                    "wait_edges_before": edges_before,
+                    "info": (f"{t.name} {lock_desc}，写入新版本 "
+                             f"v{v.vid}={_fmt(value)}（未提交，严格 2PL 下他人不可读写）"),
+                }, t)
+                finish_snapshot(st)
+
+        if events == 0:
+            raise SimError("S2PL 推演停滞：一轮中没有任何事务推进（内部错误）")
+
+    # 最终状态：每键按提交顺序最新已提交版本（回滚版本不可见）
+    final_state: "OrderedDict[str, Any]" = OrderedDict()
+    for key in chains:
+        latest = _rc_latest(chains, key)
+        if latest is not None:
+            final_state[key] = {
+                "vid": latest.vid, "value": latest.value,
+                "writer": latest.writer,
+            }
+
+    return {
+        "mode": "2PL",
+        "steps": steps,
+        "deadlocks": deadlocks,
+        "txn_final": {
+            t.name: {
+                "status": t.status,
+                "begin_seq": t.begin_seq,
+                "commit_seq": t.commit_seq,
+                "abort_seq": t.abort_seq,
+                "reads": [
+                    {"key": k, "seq": s, "vid": vid}
+                    for (k, s, vid) in t.reads
+                ],
+                "writes": [
+                    {"key": k, "wseq": s} for (k, s) in t.writes
+                ],
+            }
+            for t in txn_list
+        },
+        "final_state": final_state,
+    }
+
+
+def run_twopl(initial_text: str, txn_texts: List[str]) -> dict:
+    """S2PL 推演入口：解析初始键值与 2~3 条事务脚本。"""
+    initial = parse_initial(initial_text)
+    if not 2 <= len(txn_texts) <= 3:
+        raise SimError("需要 2~3 条事务脚本")
+    txn_scripts = [(f"T{i+1}", text) for i, text in enumerate(txn_texts)]
+    return {
+        "initial": {k: v for k, v in initial.items()},
+        "result": simulate_twopl(initial, txn_scripts),
     }

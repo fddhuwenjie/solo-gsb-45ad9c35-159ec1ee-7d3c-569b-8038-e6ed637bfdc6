@@ -2,20 +2,26 @@
 
 用 Python + FastAPI + 原生 HTML/CSS/JavaScript 构建的事务调度可视化网页：
 编辑初始键值与 2～3 条事务脚本，系统按**轮转调度**（依次从各事务队头取操作）
-排出同一份全局调度，再分别在三种隔离级别下生成确定性轨迹并逐步展示。
+排出同一份全局调度，再分别在三种隔离级别下生成确定性轨迹并逐步展示；
+另提供**严格两阶段锁（Strict 2PL）**推演：锁冲突会真正改变执行顺序，
+阻塞、释放重试与等待图死锁回滚均可逐步查看。
 
-## 隔离级别语义
+## 隔离级别与锁协议
 
-| 隔离级别 | 读取规则 |
+| 模式 | 规则 |
 |---|---|
 | **Read Uncommitted (RU)** | 读键上的**最新写入**，包括其他事务尚未提交的版本；写入方若随后 ABORT，该读列入「脏读清单」 |
 | **Read Committed (RC)** | 每次读只取键上**最新已提交版本**——“最新”按**提交顺序**而非写入顺序（先写者可以晚提交，晚提交者即为当前版本）；不读未提交数据，亦不看自身未提交的写 |
 | **Snapshot Isolation (SI)** | 读 **BEGIN 时的快照**，自身写入优先；BEGIN 之后同键若已被其他事务提交，提交时按**首提交者胜**整笔回滚 |
+| **Strict 2PL（严格两阶段锁）** | `READ` 取**共享锁 S**、`WRITE` 取**排他锁 X**（已持 S 可升级为 X，S 与 S 兼容、其余冲突）；**所有锁持有到 COMMIT / ABORT 才释放**。冲突时记录持锁阻塞者、**保留队头**并转试其他事务，锁释放后下一轮自动重试；**等待关系成环**时回滚**环内编号最大**的事务：撤销其写入、跳过剩余操作并释放锁。读值**自身写入优先**，否则取按提交顺序最新的已提交版本 |
 
 页面支持：
 
 - 逐步 / 自动播放每一条调度操作，展示**读值、来源版本、写入者**与逐条解释；
 - 每一步刷新**版本链**（初始 / 未提交 / 已提交 / 已回滚版本，读写位置高亮）与事务状态；
+- 切换 **Strict 2PL** 标签可查看加锁推演：锁表（S/X 与持锁者）、等待图（成环红色高亮）、
+  阻塞保留队头与释放后重试、死锁时回滚环内编号最大者（撤销写入 / 跳过操作 / 释放锁）、
+  读值来源（自身写入优先否则最新已提交）与最终状态；
 - 按**已提交事务的真实读写关系**生成三种依赖边：
   - `WR`：Tj 读到 Ti 已提交版本（Ti → Tj）；
   - `WW`：同键上 Ti 先写、Tj 后写且均提交（Ti → Tj，**按真实写入顺序**，与提交先后无关）；
@@ -63,6 +69,50 @@
 - SI：T1 回滚不参与图；T3 读快照且没有后于其读的提交，无 WR / RW 边。
 
 页面点击「**示例4 · 同键交错提交**」即可一键加载该场景。
+
+## 严格两阶段锁（Strict 2PL）推演
+
+RU/RC/SI 共用一份预先排好的轮转调度；S2PL 则不同——**锁冲突会真正改变执行顺序**。
+推演按**轮次**进行：每轮按 T1～T3 顺序让每个未结束事务尝试一次自己的**队头操作**：
+
+- `READ` 申请 S 锁（多个事务可同时持 S），`WRITE` 申请 X 锁（与任何他人锁冲突）；
+  事务已持 S 后写同一键时申请 **S→X 升级**（若还有他人持 S 则被阻塞，可能形成“转换死锁”）；
+- 锁**直到 COMMIT / ABORT 才统一释放**（严格 2PL）；
+- 申请被拒时：在等待图上登记 `等待者 → 持锁阻塞者`，**队头操作保留（pc 不推进）**，
+  本轮继续转试其他事务；持锁者结束后等待边解除，等待者**下一轮重试**同一操作；
+- 每次阻塞后立即检测等待图：**成环即死锁**，回滚**环内编号最大**的事务
+  （`max(Ti 中的 i)`）——其写入版本全部标记为已回滚（**后续任何读取都不可见**）、
+  剩余操作跳过、持有的锁全部释放，环上其他事务随后重试。
+
+### 死锁示例（页面「2PL示例1 · 两事务死锁」一键加载）
+
+初始 `x=0, y=0`：
+
+```
+T1: BEGIN  WRITE x 1  WRITE y 1  COMMIT
+T2: BEGIN  WRITE y 2  WRITE x 2  COMMIT
+```
+
+| 步 | 轮次 | 操作 | 锁 / 等待图 |
+|---|---|---|---|
+| 1–2 | 1 | T1、T2 `BEGIN` | — |
+| 3 | 2 | T1 `WRITE x 1` | T1 持 x 的 X 锁，生成未提交 v3 |
+| 4 | 2 | T2 `WRITE y 2` | T2 持 y 的 X 锁，生成未提交 v4 |
+| 5 | 3 | T1 `WRITE y 1` **等待** | 被 T2 阻塞，等待边 T1→T2，队头保留 |
+| 6 | 3 | T2 `WRITE x 2` **死锁** | 被 T1 阻塞后等待图成环 `T2 → T1 → T2`；回滚环内编号最大的 **T2**：v4 作废、跳过 `WRITE x 2` 与 `COMMIT`、释放 y |
+| 7 | 4 | T1 重试 `WRITE y 1` | 锁已释放，写入 v5 |
+| 8 | 5 | T1 `COMMIT` | v3、v5 转为已提交并释放 x、y |
+
+最终状态 `x=1, y=1`（均为 T1 提交）；T2 写入的 `y=2` 已回滚，任何后续读取都不会见到它。
+页面右侧同步展示**锁表**（每键 S/X 与持锁事务）、**等待图**（环上红色高亮）、
+**死锁处理记录**与**最终状态**；步骤条上黄色为阻塞、红色为死锁回滚。
+
+另两个一键示例：
+
+- **2PL示例2 · 三事务死锁环**：`T1→T2→T3→T1` 三环等待，回滚编号最大的 T3，
+  随后 T2 再等 T1 释放 x 后提交（演示一次推演中锁释放后的重试）；
+- **2PL示例3 · 阻塞与锁释放重试**：T2 的 `READ x` 被持 X 锁的 T1 阻塞，
+  T1 提交后 T2 重试读到**按提交顺序最新**的已提交值 11，再写 22。
 
 ## 事务脚本语法
 
@@ -123,6 +173,55 @@ uvicorn app.main:app --reload --port 8000
 
 返回三种隔离级别各自的 `steps`（含每步版本链快照、读值来源、事务状态）、
 `dirty_reads` 与 `graph`（节点 / WR·WW·RW 边 / 环路径）。
+
+### 严格两阶段锁接口
+
+`POST /api/twopl` —— 请求体与 `/api/simulate` 相同（初始键值 + 2～3 条脚本），
+返回 S2PL 下的实际执行序列：锁申请/升级/等待/释放、等待图成环与回滚、读值来源、
+逐步版本链 / 锁表 / 等待边 / 事务状态，以及死锁记录与最终状态。
+
+```bash
+curl -s -X POST http://localhost:8000/api/twopl \
+  -H "Content-Type: application/json" \
+  -d '{
+    "initial": "x=0\ny=0",
+    "txns": [
+      "BEGIN\nWRITE x 1\nWRITE y 1\nCOMMIT",
+      "BEGIN\nWRITE y 2\nWRITE x 2\nCOMMIT"
+    ]
+  }'
+```
+
+响应要点（`result` 内）：
+
+- `steps[]`：每个元素是一次尝试，含
+  - `round`（轮次）、`kind`（`begin/read/write/wait/deadlock/commit/abort`）、
+    `op/key/value`；
+  - 锁信息 `lock_mode`（`S` / `X` / `upgrade` / `…-reentrant`）与
+    `lock_action`（`acquire` / `upgrade` / `wait` / `release` / `reentrant`）；
+  - 阻塞时 `blockers`（持锁阻塞者）、`blocker_key`，等待图前后快照
+    `wait_edges_before/after`；
+  - 死锁步 `cycle`（环路径）、`victim`（环内编号最大者）、
+    `undone_vids`（撤销写入）、`skipped_ops`（跳过的剩余操作）；
+  - 读步 `read_value/read_vid/read_writer/read_source`
+    （`own` 自身写入 / `committed` 最新已提交 / `initial` 初始值 / `missing` 无此键）；
+  - 每步后的 `chains_after`（版本链）、`locks_after`（锁表）、
+    `wait_edges_after`（等待图）、`txns_after`（事务状态与持锁键）。
+- `deadlocks[]`：每次死锁的 `seq / cycle / cycle_label / victim / undone_vids /
+  released_keys / skipped_ops / detail`；
+- `txn_final`：每事务最终状态与全部读/写记录；
+- `final_state`：每个键按提交顺序最新的已提交版本（回滚写入不在其中）。
+
+用 `jq` 只看执行概览：
+
+```bash
+curl -s -X POST http://localhost:8000/api/twopl \
+  -H "Content-Type: application/json" \
+  -d '{"initial":"x=0\ny=0","txns":[
+       "BEGIN\nWRITE x 1\nWRITE y 1\nCOMMIT",
+       "BEGIN\nWRITE y 2\nWRITE x 2\nCOMMIT"]}' \
+  | jq '.result.steps[] | {seq, round, txn, kind, op: .op, key, blockers, victim, read: .read_value}'
+```
 
 ### 调度对照接口
 

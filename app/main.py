@@ -1,4 +1,4 @@
-"""FastAPI 入口：推演 API + 调度对照 API + 静态页面。"""
+"""FastAPI 入口：推演 API + 严格两阶段锁 API + 调度对照 API + 静态页面。"""
 
 from pathlib import Path
 from typing import List, Union
@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .simulator import SimError, run_all, run_compare
+from .simulator import SimError, run_all, run_compare, run_twopl
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -44,6 +44,17 @@ async def simulate(req: SimulateRequest):
         raise HTTPException(status_code=400, detail="事务脚本不能为空")
     try:
         return run_all(req.initial, req.txns)
+    except SimError as exc:
+        raise SimError(str(exc))
+
+
+@app.post("/api/twopl")
+async def twopl(req: SimulateRequest):
+    """严格两阶段锁（Strict 2PL）推演：S/X 锁、阻塞重试、等待图死锁回滚。"""
+    if len(req.txns) != len([t for t in req.txns if t.strip()]):
+        raise HTTPException(status_code=400, detail="事务脚本不能为空")
+    try:
+        return run_twopl(req.initial, req.txns)
     except SimError as exc:
         raise SimError(str(exc))
 

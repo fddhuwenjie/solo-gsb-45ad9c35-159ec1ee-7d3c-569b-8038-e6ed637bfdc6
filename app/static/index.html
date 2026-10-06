@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>事务交错推演 · Read Uncommitted / Read Committed / Snapshot Isolation</title>
+<title>事务交错推演 · RU / RC / SI / 严格两阶段锁（Strict 2PL）</title>
 <style>
   :root {
     --bg: #0f1420;
@@ -200,12 +200,44 @@
   details.cmp-all ul { margin: 6px 0 0; padding-left: 16px; }
   details.cmp-all li { font-size: 11px; margin-bottom: 3px; }
   .chip.firstdiff { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); color: #ffb0b0; }
+  .chip.wait { background: rgba(232,179,74,.12); border-color: #8a6a22; color: #ffd98a; }
+  .chip.deadlock { background: rgba(239,107,107,.18); border-color: var(--red); color: #ffb0b0; }
+  .chip.begin { color: #7e8cab; }
+  .chip.end-commit { color: var(--green); }
+  .chip.end-abort { color: var(--red); }
+  /* S2PL */
+  .tag.wait { background: rgba(232,179,74,.18); color: var(--amber); }
+  .tag.lock { background: rgba(91,140,255,.15); color: #8fb0ff; }
+  .tag.victim { background: rgba(239,107,107,.22); color: #ff9c9c; }
+  .step-card.wait { border-color: #8a6a22; box-shadow: 0 0 0 1px rgba(232,179,74,.35); }
+  .step-card.deadlock { border-color: rgba(239,107,107,.9); box-shadow: 0 0 0 1px rgba(239,107,107,.5); }
+  .lock-table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--mono); }
+  .lock-table th, .lock-table td { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; }
+  .lock-table th { color: var(--muted); font-weight: 600; font-size: 11px; }
+  .lock-mode { font-weight: 700; padding: 1px 8px; border-radius: 9px; font-size: 11px; }
+  .lock-mode.S { background: rgba(91,140,255,.18); color: #9dbbff; }
+  .lock-mode.X { background: rgba(239,107,107,.18); color: #ff9c9c; }
+  .lock-mode.X-reentrant { background: rgba(239,107,107,.10); color: #e8a0a0; }
+  .holder-pill { display: inline-block; padding: 0 7px; margin: 1px 3px 1px 0; border-radius: 9px;
+                 border: 1px solid var(--line); font-size: 11px; }
+  svg.waitgraph { width: 100%; height: 190px; }
+  .wait-edge { stroke: var(--amber); stroke-width: 2; fill: none; }
+  .wait-edge.cycle { stroke: var(--red); stroke-width: 3.2; }
+  .wait-node-text { fill: var(--text); font-family: var(--mono); font-size: 12px; font-weight: 700;
+                    text-anchor: middle; dominant-baseline: central; }
+  .dl-item { border-left: 3px solid var(--red); padding: 6px 10px; margin-bottom: 8px;
+             background: rgba(239,107,107,.07); border-radius: 0 6px 6px 0; font-size: 12px; }
+  .dl-cycle { font-family: var(--mono); color: #ffb0b0; font-weight: 700; }
+  .final-grid { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 14px; font-size: 13px; }
+  .final-grid .k { font-family: var(--mono); font-weight: 700; }
+  .final-grid .v { font-family: var(--mono); }
+  .final-grid .w { color: var(--muted); font-family: var(--mono); font-size: 11px; }
 </style>
 </head>
 <body>
 <header>
   <h1>事务交错推演（Transaction Interleaving Playground）</h1>
-  <p>编辑初始键值与 2～3 条事务脚本，轮转调度生成全局序列，逐步对比 Read Uncommitted、Read Committed、Snapshot Isolation 的读值来源、版本链与依赖图；也可输入自定义执行顺序，与默认轮转做调度对照。</p>
+  <p>编辑初始键值与 2～3 条事务脚本，轮转调度生成全局序列，逐步对比 Read Uncommitted、Read Committed、Snapshot Isolation 的读值来源、版本链与依赖图；另提供<b>严格两阶段锁（Strict 2PL）</b>推演：S/X 锁阻塞、释放重试、等待图死锁回滚环内编号最大者。也可输入自定义执行顺序做调度对照。</p>
 </header>
 <main>
   <section class="panel">
@@ -288,7 +320,7 @@ y=0</textarea>
         </div>
         <div class="right-col">
           <div id="alertsBox"></div>
-          <div class="panel" style="margin:0">
+          <div class="panel" id="graphPanel" style="margin:0">
             <h2 style="margin-bottom:8px">WR / WW / RW 依赖图（仅已提交事务）</h2>
             <svg class="graph" id="graphSvg" viewBox="0 0 400 260"></svg>
             <div class="legend">
@@ -296,6 +328,20 @@ y=0</textarea>
               <span class="l-ww">WW 写→写</span>
               <span class="l-rw">RW 读→后写（反依赖）</span>
             </div>
+          </div>
+          <div class="panel" id="lockPanel" style="margin:0;display:none">
+            <h2 style="margin-bottom:8px">锁表（持锁到 COMMIT / ABORT 才释放）</h2>
+            <div id="lockBox"></div>
+            <h2 style="margin:14px 0 6px;font-size:13px">等待图（等待者 → 持锁阻塞者）</h2>
+            <svg class="waitgraph" id="waitSvg" viewBox="0 0 400 190"></svg>
+          </div>
+          <div class="panel" id="deadlockPanel" style="margin:0;display:none">
+            <h2 style="margin-bottom:8px">死锁处理记录</h2>
+            <div id="deadlockBox"></div>
+          </div>
+          <div class="panel" id="finalPanel" style="margin:0;display:none">
+            <h2 style="margin-bottom:8px">最终状态（回滚写入不可见）</h2>
+            <div id="finalBox"></div>
           </div>
           <div class="panel" style="margin:0">
             <h2 style="margin-bottom:8px">事务状态</h2>
@@ -306,7 +352,8 @@ y=0</textarea>
     </div>
   </section>
   <section id="emptyHint" class="panel placeholder">
-    配置好脚本后点击「生成调度并推演」，三种隔离级别共用默认轮转调度、结果并排可比；
+    配置好脚本后点击「生成调度并推演」，RU / RC / SI 三种隔离级别共用默认轮转调度、结果并排可比，
+    另可切换 <b>Strict 2PL</b> 标签查看加锁、阻塞重试、等待图死锁回滚与最终状态；
     或填写自定义执行顺序后点击「对照推演」，与默认轮转逐侧对比。
   </section>
 </main>
@@ -318,12 +365,14 @@ const TXN_COLORS = { T1: "var(--t1)", T2: "var(--t2)", T3: "var(--t3)" };
 const MODE_LABEL = {
   RU: "Read Uncommitted（读未提交）",
   RC: "Read Committed（读已提交）",
-  SI: "Snapshot Isolation（快照隔离）"
+  SI: "Snapshot Isolation（快照隔离）",
+  "2PL": "Strict 2PL（严格两阶段锁）"
 };
 const MODE_RULE = {
   RU: "每次读取取键上的最新写入（含其他事务未提交版本）。",
   RC: "每次读取只取键上最新已提交版本；不读未提交数据，也不看自己未提交的写。",
-  SI: "读取基于 BEGIN 时的快照，自身写入优先；快照后同键被他人提交，则提交时整笔回滚（首提交者胜）。"
+  SI: "读取基于 BEGIN 时的快照，自身写入优先；快照后同键被他人提交，则提交时整笔回滚（首提交者胜）。",
+  "2PL": "READ 取 S 锁、WRITE 取 X 锁（已有 S 可升级）；锁持有到 COMMIT/ABORT。冲突即阻塞、保留队头转试他人，释放后重试；等待图成环则回滚环内编号最大者。"
 };
 
 const EXAMPLES = [
@@ -367,10 +416,44 @@ const EXAMPLES = [
       "BEGIN\nWRITE x 2\nCOMMIT",
       "BEGIN\nREAD b\nREAD c\nREAD x\nCOMMIT"
     ]
+  },
+  {
+    name: "2PL示例1 · 两事务死锁",
+    desc: "严格 2PL：T1 持 x 等 y、T2 持 y 等 x，等待图成环 → 回滚环内编号最大的 T2，其写入作废、剩余操作跳过；T1 重试后提交，最终 x=y=1。",
+    initial: "x=0\ny=0",
+    enableT3: false,
+    twopl: true,
+    txns: [
+      "BEGIN\nWRITE x 1\nWRITE y 1\nCOMMIT",
+      "BEGIN\nWRITE y 2\nWRITE x 2\nCOMMIT"
+    ]
+  },
+  {
+    name: "2PL示例2 · 三事务死锁环",
+    desc: "T1 持 x 等 z、T2 持 y 等 x、T3 持 z 等 y，三环等待 → 回滚编号最大的 T3；随后 T1 提交，T2 再等 T1 释放 x 后提交。",
+    initial: "x=0\ny=0\nz=0",
+    enableT3: true,
+    twopl: true,
+    txns: [
+      "BEGIN\nWRITE x 1\nWRITE z 1\nCOMMIT",
+      "BEGIN\nWRITE y 2\nWRITE x 2\nCOMMIT",
+      "BEGIN\nWRITE z 3\nWRITE y 3\nCOMMIT"
+    ]
+  },
+  {
+    name: "2PL示例3 · 阻塞与锁释放重试",
+    desc: "T1 持 x 的 X 锁写入 11；T2 先 READ x 被阻塞、保留队头，T1 提交释放后 T2 重试读到已提交的 11（读自己的写入优先，否则取最新已提交版本），再写 22 并提交。",
+    initial: "x=10",
+    enableT3: false,
+    twopl: true,
+    txns: [
+      "BEGIN\nWRITE x 11\nCOMMIT",
+      "BEGIN\nREAD x\nWRITE x 22\nCOMMIT"
+    ]
   }
 ];
 
-const state = { data: null, cmp: null, view: "single", side: "custom", mode: "RU", idx: 0, timer: null };
+const state = { data: null, twopl: null, cmp: null, view: "single", side: "custom", mode: "RU", idx: 0, timer: null };
 
 const $ = id => document.getElementById(id);
 
@@ -407,8 +490,13 @@ function loadExample(i) {
   $("t2").value = ex.txns[1];
   $("t3").value = ex.txns[2] || "";
   hideError();
-  fillDefaultOrder();
-  run();
+  if (ex.twopl) {
+    fillDefaultOrder();
+    run("2PL");
+  } else {
+    fillDefaultOrder();
+    run();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +512,7 @@ function collectTxns() {
   return list;
 }
 
-async function run() {
+async function run(preferMode) {
   stopPlay();
   const txns = collectTxns().map(t => t.text);
   if (txns.some(t => !t.trim())) {
@@ -446,15 +534,41 @@ async function run() {
   }
   hideError();
   state.data = data;
+  state.twopl = null;
   state.cmp = null;
   state.view = "single";
-  state.mode = "RU";
+  state.mode = (preferMode === "2PL") ? "2PL" : "RU";
   state.idx = 0;
   $("emptyHint").style.display = "none";
   $("resultSection").style.display = "";
   $("comparePanel").style.display = "none";
   $("sideTabs").style.display = "none";
   renderTabs();
+  if (state.mode === "2PL") loadTwoPl(txns);
+  else render();
+}
+
+// 严格两阶段锁：与 RU/RC/SI 共用初始键值与事务脚本，单独请求 /api/twopl
+async function loadTwoPl(txnsArg) {
+  const txns = (txnsArg || collectTxns().map(t => t.text));
+  let resp;
+  try {
+    resp = await fetch("/api/twopl", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initial: $("initial").value, txns })
+    });
+  } catch (e) {
+    state.twopl = null;
+    return showError("2PL 请求网络错误：" + e.message);
+  }
+  const data = await resp.json();
+  if (!resp.ok) {
+    state.twopl = null;
+    return showError(data.detail || "2PL 推演失败");
+  }
+  state.twopl = data.result;
+  state.idx = 0;
   render();
 }
 
@@ -554,14 +668,36 @@ function renderTabs() {
   tabs.innerHTML = "";
   const results = currentResults();
   if (!results) return;
-  for (const m of ["RU", "RC", "SI"]) {
-    const g = results[m].graph;
+  const modes = state.view === "compare" ? ["RU", "RC", "SI"] : ["RU", "RC", "SI", "2PL"];
+  for (const m of modes) {
+    let bad, badText, okText;
+    if (m === "2PL") {
+      const r = twoplResult();
+      bad = !!(r && r.deadlocks.length);
+      badText = `死锁×${r ? r.deadlocks.length : 0}`;
+      okText = "无死锁";
+    } else {
+      const g = results[m].graph;
+      bad = g.has_cycle;
+      badText = "环!";
+      okText = "可串行化";
+    }
     const div = document.createElement("div");
     div.className = "tab" + (m === state.mode ? " active" : "");
     div.innerHTML = `${esc(MODE_LABEL[m])}` +
-      `<span class="verdict ${g.has_cycle ? "bad" : "ok"}">` +
-      `${g.has_cycle ? "环!" : "可串行化"}</span>`;
-    div.onclick = () => { stopPlay(); state.mode = m; renderTabs(); render(); };
+      `<span class="verdict ${bad ? "bad" : "ok"}">${bad ? badText : okText}</span>`;
+    div.onclick = () => {
+      stopPlay();
+      state.mode = m;
+      state.idx = 0;
+      renderTabs();
+      if (m === "2PL") {
+        if (!state.twopl) render();   // 先显示“推演中”占位，loadTwoPl 结束后再渲染
+        loadTwoPl();
+      } else {
+        render();
+      }
+    };
     tabs.appendChild(div);
   }
 }
@@ -674,7 +810,14 @@ function currentResults() {
   return state.data ? state.data.results : null;
 }
 
-function result() { return currentResults()[state.mode]; }
+function result() {
+  if (state.mode === "2PL") return state.twopl;
+  return currentResults()[state.mode];
+}
+
+function twoplResult() {
+  return state.view === "single" ? state.twopl : null;
+}
 
 // 对照视图下当前侧首次差异所在的步号（无差异或单跑视图时为 null）
 function firstDiffSeq() {
@@ -685,6 +828,10 @@ function firstDiffSeq() {
 }
 
 function render() {
+  if (state.mode === "2PL") {
+    render2PL();
+    return;
+  }
   if (!currentResults()) return;
   const r = result();
   const n = r.steps.length;
@@ -692,12 +839,53 @@ function render() {
   const sideTag = state.view === "compare" && state.cmp
     ? `【${state.side === "default" ? "默认轮转" : "自定义顺序"}】` : "";
   $("posText").textContent = `${sideTag}第 ${state.idx + 1} / ${n} 步 · ${MODE_RULE[state.mode]}`;
+  $("graphPanel").style.display = "";
+  $("lockPanel").style.display = "none";
+  $("deadlockPanel").style.display = "none";
+  $("finalPanel").style.display = "none";
   renderChips(r);
   renderStep(r.steps[state.idx]);
   renderChains(r.steps[state.idx]);
   renderStatus(r.steps[state.idx]);
   renderAlerts(r);
   renderGraph(r.graph);
+}
+
+// ---------------------------------------------------------------------------
+// S2PL 渲染
+// ---------------------------------------------------------------------------
+
+function render2PL() {
+  const r = state.twopl;
+  if (!r) {
+    $("posText").textContent = "Strict 2PL 推演中…";
+    $("chips").innerHTML = "";
+    $("stepCard").innerHTML = `<div class="placeholder">正在请求 /api/twopl …</div>`;
+    $("chainsBox").innerHTML = "";
+    $("lockBox").innerHTML = "";
+    $("waitSvg").innerHTML = "";
+    $("deadlockBox").innerHTML = "";
+    $("finalBox").innerHTML = "";
+    $("alertsBox").innerHTML = "";
+    $("statusBox").innerHTML = "";
+    return;
+  }
+  const n = r.steps.length;
+  state.idx = Math.max(0, Math.min(state.idx, n - 1));
+  $("posText").textContent = `第 ${state.idx + 1} / ${n} 步（轮次见卡片） · ${MODE_RULE["2PL"]}`;
+  $("graphPanel").style.display = "none";
+  $("lockPanel").style.display = "";
+  $("deadlockPanel").style.display = r.deadlocks.length ? "" : "none";
+  $("finalPanel").style.display = state.idx >= n - 1 ? "" : "none";
+  renderChips(r);
+  render2PLStep(r.steps[state.idx]);
+  renderChains(r.steps[state.idx]);
+  render2PLStatus(r.steps[state.idx]);
+  render2PLAlerts(r);
+  renderLocks(r.steps[state.idx]);
+  renderWaitGraph(r.steps[state.idx], r);
+  renderDeadlocks(r);
+  renderFinal(r);
 }
 
 function opShort(step) {
@@ -710,13 +898,23 @@ function renderChips(r) {
   const box = $("chips");
   box.innerHTML = "";
   const fdSeq = firstDiffSeq();
+  const is2PL = state.mode === "2PL";
   r.steps.forEach((s, i) => {
     const c = document.createElement("div");
-    c.className = "chip" + (i < state.idx ? " done" : "") +
-      (i === state.idx ? " current" : "") +
-      (s.in_cycle ? " cycle" : "") +
-      (s.dirty_candidate ? " dirty" : "") +
-      (s.seq === fdSeq ? " firstdiff" : "");
+    let cls = "chip" + (i < state.idx ? " done" : "") +
+      (i === state.idx ? " current" : "");
+    if (!is2PL) {
+      cls += (s.in_cycle ? " cycle" : "") +
+        (s.dirty_candidate ? " dirty" : "") +
+        (s.seq === fdSeq ? " firstdiff" : "");
+    } else {
+      if (s.kind === "wait") cls += " wait";
+      if (s.kind === "deadlock") cls += " deadlock";
+      if (s.kind === "begin") cls += " begin";
+      if (s.kind === "commit") cls += " end-commit";
+      if (s.kind === "abort") cls += " end-abort";
+    }
+    c.className = cls;
     c.innerHTML = `<span class="cseq">${s.seq}</span>${s.txn} ${esc(opShort(s))}`;
     c.onclick = () => { stopPlay(); state.idx = i; render(); };
     box.appendChild(c);
@@ -798,7 +996,8 @@ function renderChains(step) {
       let hl = "", ring = "";
       if (v.vid === step.read_vid) { hl = " hl-read"; ring = `<span class="ring-label read">读</span>`; }
       if (v.vid === step.new_vid) { hl = " hl-write"; ring = `<span class="ring-label write">写</span>`; }
-      if (v.vid === step.conflict_vid) { hl = " hl-conflict"; ring = `<span class="ring-label conflict">冲突</span>`; }
+      if (step.conflict_vid && v.vid === step.conflict_vid) { hl = " hl-conflict"; ring = `<span class="ring-label conflict">冲突</span>`; }
+      if ((step.undone_vids || []).includes(v.vid)) { hl = " hl-conflict"; ring = `<span class="ring-label conflict">撤销</span>`; }
       const kindLabel = { initial: "初始", uncommitted: "未提交", committed: "已提交", aborted: "已回滚" }[v.kind];
       html += `<div class="vbadge ${v.kind}${hl}">
         ${ring}
@@ -851,6 +1050,195 @@ function renderAlerts(r) {
     html += `<div class="alert ok" style="font-size:12px">本调度中没有读到“后来回滚”的数据。</div>`;
   }
   box.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// S2PL 专用渲染
+// ---------------------------------------------------------------------------
+
+function lockModeLabel(m) {
+  return { S: "S 共享", X: "X 排他", "S-reentrant": "已持 S", "X-reentrant": "已持 X",
+           upgrade: "S→X 升级", reentrant: "已持锁" }[m] || m;
+}
+
+function render2PLStep(step) {
+  const card = $("stepCard");
+  card.className = "step-card " + (step.kind === "deadlock" ? "deadlock"
+                                   : step.kind === "wait" ? "wait" : "");
+  let tags = "";
+  if (step.kind === "wait") tags += `<span class="tag wait">阻塞等待</span>`;
+  if (step.kind === "deadlock") {
+    tags += `<span class="tag victim">死锁回滚 ${esc(step.victim)}</span>`;
+  }
+  if (step.lock_action === "acquire") tags += `<span class="tag lock">获得 ${lockModeLabel(step.lock_mode)}</span>`;
+  if (step.lock_action === "upgrade") tags += `<span class="tag lock">S→X 升级</span>`;
+  if (step.lock_action === "release") tags += `<span class="tag lock">释放全部锁</span>`;
+
+  let inner = `
+    <div class="step-top">
+      <span class="seq-badge">#${step.seq} · 第 ${step.round} 轮</span>
+      ${txnBadge(step.txn)}
+      <span class="op-text">${esc(opShort(step))}</span>
+      ${tags}
+    </div>
+    <p class="step-info">${esc(step.info)}</p>`;
+
+  if (step.op === "READ" && step.read_source && step.read_source !== "missing") {
+    inner += `<div class="kv-mini">
+      <span class="k">读值</span><span class="v">${esc(fmt(step.read_value))}</span>
+      <span class="k">读到版本</span><span class="v">v${step.read_vid}</span>
+      <span class="k">写入者</span><span class="v">${step.read_writer === "INIT" ? "初始数据" : esc(step.read_writer)}</span>
+      <span class="k">来源</span><span class="v">${sourceLabel(step.read_source)}</span>
+    </div>`;
+  } else if (step.op === "READ" && step.kind !== "wait" && step.kind !== "deadlock") {
+    inner += `<div class="kv-mini"><span class="k">读值</span><span class="v">∅（键 ${esc(step.key)} 尚无已提交版本）</span></div>`;
+  }
+  if (step.new_vid) {
+    inner += `<div class="kv-mini">
+      <span class="k">新版本</span><span class="v">v${step.new_vid}（未提交）</span>
+      <span class="k">写入值</span><span class="v">${esc(fmt(step.value))}</span>
+    </div>`;
+  }
+  if (step.blockers && step.blockers.length) {
+    inner += `<div class="kv-mini">
+      <span class="k">阻塞者</span><span class="v">${step.blockers.map(b => esc(b)).join("、")} 持键 ${esc(step.blocker_key)} 的锁</span>
+      <span class="k">队头</span><span class="v">保留（pc 不推进），本轮转试其他事务，释放后下一轮重试</span>
+    </div>`;
+  }
+  if (step.kind === "deadlock") {
+    inner += `<div class="kv-mini">
+      <span class="k">等待环</span><span class="v" style="color:#ffb0b0;font-family:var(--mono)">${esc(step.cycle.join(" → "))} → ${esc(step.cycle[0])}</span>
+      <span class="k">牺牲者</span><span class="v" style="color:#ff9c9c">${esc(step.victim)}（环内编号最大）</span>
+      <span class="k">撤销写入</span><span class="v">${step.undone_vids.length ? step.undone_vids.map(v => "v" + v).join(", ") : "无"}</span>
+      <span class="k">跳过操作</span><span class="v">${step.skipped_ops.map(esc).join("；") || "无"}</span>
+    </div>`;
+  }
+  card.innerHTML = inner;
+}
+
+function render2PLStatus(step) {
+  const box = $("statusBox");
+  box.innerHTML = "";
+  for (const [name, st] of Object.entries(step.txns_after || {})) {
+    const pill = document.createElement("span");
+    pill.className = `status-pill ${st.status}`;
+    let tail = "";
+    if (st.commit_seq != null) tail = ` @${st.commit_seq}提交`;
+    else if (st.abort_seq != null) tail = ` @${st.abort_seq}回滚`;
+    else if (st.status === "active") tail = ` 锁:[${(st.locks || []).join(",")}]`;
+    pill.style.borderColor = (st.status === "active" || st.status === "committed")
+      ? (name === "T1" ? "var(--t1)" : name === "T2" ? "var(--t2)" : "var(--t3)") : undefined;
+    pill.innerHTML = `${name}：${statusLabel(st.status)}<span style="opacity:.7">${tail}</span>`;
+    box.appendChild(pill);
+  }
+}
+
+function renderLocks(step) {
+  const box = $("lockBox");
+  const locks = step.locks_after || {};
+  const keys = Object.keys(locks);
+  if (!keys.length) {
+    box.innerHTML = `<div style="color:var(--muted);font-size:12px">当前没有任何事务持锁。</div>`;
+    return;
+  }
+  let html = `<table class="lock-table"><thead><tr><th>键</th><th>模式</th><th>持锁事务</th></tr></thead><tbody>`;
+  for (const key of keys) {
+    const lk = locks[key];
+    const holders = lk.holders.map(h =>
+      `<span class="holder-pill" style="border-color:${TXN_COLORS[h] || "#888"};color:${TXN_COLORS[h] || "#ccc"}">${esc(h)}</span>`
+    ).join("");
+    html += `<tr><td>${esc(key)}</td><td><span class="lock-mode ${lk.mode}">${lk.mode}</span></td><td>${holders}</td></tr>`;
+  }
+  html += `</tbody></table>`;
+  box.innerHTML = html;
+}
+
+function renderWaitGraph(step, r) {
+  const svg = $("waitSvg");
+  const W = 400, H = 190, cx = W / 2, cy = H / 2, R = 62;
+  const names = Object.keys(step.txns_after || {});
+  const pos = {};
+  names.forEach((n, i) => {
+    const ang = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(names.length, 1);
+    pos[n] = [cx + R * Math.cos(ang), cy + R * Math.sin(ang)];
+  });
+  const edges = step.wait_edges_after || [];
+  const cycleNow = new Set();
+  if (step.kind === "deadlock" && step.cycle) {
+    step.cycle.forEach(n => cycleNow.add(n));
+  }
+  const defs = [`<marker id="warr" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="var(--amber)"/></marker>`];
+  let body = "";
+  edges.forEach(e => {
+    const [x1, y1] = pos[e.from], [x2, y2] = pos[e.to];
+    if (x1 == null || x2 == null) return;
+    const inCycle = cycleNow.has(e.from) && cycleNow.has(e.to);
+    const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1, gap = 20;
+    const sx = x1 + (dx / len) * gap, sy = y1 + (dy / len) * gap;
+    const tx = x2 - (dx / len) * gap, ty = y2 - (dy / len) * gap;
+    body += `<path class="wait-edge${inCycle ? " cycle" : ""}" d="M${sx},${sy} L${tx},${ty}"
+      marker-end="url(#warr)"/>`;
+  });
+  names.forEach(n => {
+    const [x, y] = pos[n];
+    const st = step.txns_after[n];
+    const victim = step.kind === "deadlock" && step.victim === n;
+    const stroke = victim ? "var(--red)" : (n === "T1" ? "var(--t1)" : n === "T2" ? "var(--t2)" : "var(--t3)");
+    const fill = st.status === "committed" ? "rgba(70,201,143,.18)"
+      : st.status === "aborted" ? "rgba(239,107,107,.18)" : "rgba(255,255,255,.05)";
+    body += `<circle cx="${x}" cy="${y}" r="19" fill="${fill}" stroke="${stroke}" stroke-width="${victim ? 3 : 1.7}"/>`;
+    body += `<text class="wait-node-text" x="${x}" y="${y}">${n}</text>`;
+  });
+  if (edges.length) {
+    svg.innerHTML = `<defs>${defs.join("")}</defs>${body}`;
+  } else {
+    svg.innerHTML = `<text x="${cx}" y="${cy}" fill="#93a1b8" font-size="12" text-anchor="middle">当前无等待关系</text>`;
+  }
+}
+
+function render2PLAlerts(r) {
+  const box = $("alertsBox");
+  let html = "";
+  if (r.deadlocks.length) {
+    html += `<div class="alert cycle"><strong>⚠ 共检测到 ${r.deadlocks.length} 次死锁，均回滚环内编号最大的事务</strong>
+      <ul>${r.deadlocks.map(d => `<li>第 ${d.seq} 步：<span class="dl-cycle">${esc(d.cycle_label)}</span> → 回滚 ${esc(d.victim)}</li>`).join("")}</ul></div>`;
+  } else {
+    html += `<div class="alert ok">✔ 本次推演未出现等待环：阻塞均在锁释放后重试成功。</div>`;
+  }
+  const aborted = Object.entries(r.txn_final).filter(([, v]) => v.status === "aborted");
+  if (aborted.length) {
+    html += `<div class="alert dirty"><strong>回滚事务（写入全部作废，对后续读取不可见）</strong>
+      <ul>${aborted.map(([n, v]) => `<li>${n} 于第 ${v.abort_seq} 步回滚</li>`).join("")}</ul></div>`;
+  }
+  box.innerHTML = html;
+}
+
+function renderDeadlocks(r) {
+  const box = $("deadlockBox");
+  if (!r.deadlocks.length) { box.innerHTML = ""; return; }
+  box.innerHTML = r.deadlocks.map(d => `
+    <div class="dl-item">
+      <div>第 ${d.seq} 步 · 等待环 <span class="dl-cycle">${esc(d.cycle_label)}</span></div>
+      <div style="margin-top:3px">回滚 <strong>${esc(d.victim)}</strong>（环内编号最大）：撤销 ${d.undone_vids.length} 个写入
+        ${d.undone_vids.length ? "（" + d.undone_vids.map(v => "v" + v).join(", ") + "）" : ""}，
+        跳过 ${d.skipped_ops.length} 条剩余操作，释放键 ${d.released_keys.map(esc).join("、") || "（无）"} 上的锁。</div>
+    </div>`).join("");
+}
+
+function renderFinal(r) {
+  const box = $("finalBox");
+  const fs = r.final_state || {};
+  const keys = Object.keys(fs);
+  if (!keys.length) {
+    box.innerHTML = `<div style="color:var(--muted);font-size:12px">无任何键的已提交版本。</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="final-grid">` + keys.map(k => {
+    const e = fs[k];
+    return `<span class="k">${esc(k)}</span><span class="v">${esc(fmt(e.value))}</span>` +
+           `<span class="w">v${e.vid} · ${e.writer === "INIT" ? "初始" : esc(e.writer) + " 提交"}</span>`;
+  }).join("") + `</div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -931,7 +1319,7 @@ function renderGraph(graph) {
 // ---------------------------------------------------------------------------
 
 function bind() {
-  $("runBtn").onclick = run;
+  $("runBtn").onclick = () => run();
   $("compareBtn").onclick = runCompare;
   $("fillOrderBtn").onclick = fillDefaultOrder;
   $("clearOrderBtn").onclick = () => { $("orderInput").value = ""; };
