@@ -1,4 +1,4 @@
-"""FastAPI 入口：推演 API + 调度对照 API + 静态页面。"""
+"""FastAPI 入口：推演 API + 调度对照 API + 严格两阶段锁推演 API + 静态页面。"""
 
 from pathlib import Path
 from typing import List, Union
@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from .s2pl import run_s2pl
 from .simulator import SimError, run_all, run_compare
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -54,6 +55,16 @@ async def compare(req: CompareRequest):
         raise HTTPException(status_code=400, detail="事务脚本不能为空")
     try:
         return run_compare(req.initial, req.txns, req.order)
+    except SimError as exc:
+        raise SimError(str(exc))
+
+
+@app.post("/api/s2pl")
+async def s2pl(req: SimulateRequest):
+    if len(req.txns) != len([t for t in req.txns if t.strip()]):
+        raise HTTPException(status_code=400, detail="事务脚本不能为空")
+    try:
+        return run_s2pl(req.initial, req.txns)
     except SimError as exc:
         raise SimError(str(exc))
 

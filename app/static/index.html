@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>事务交错推演 · Read Uncommitted / Read Committed / Snapshot Isolation</title>
+<title>事务交错推演 · RU / RC / SI / 严格两阶段锁</title>
 <style>
   :root {
     --bg: #0f1420;
@@ -200,12 +200,28 @@
   details.cmp-all ul { margin: 6px 0 0; padding-left: 16px; }
   details.cmp-all li { font-size: 11px; margin-bottom: 3px; }
   .chip.firstdiff { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); color: #ffb0b0; }
+  /* 严格两阶段锁 */
+  .chip.wait { border-color: #8a6a22; background: rgba(232,179,74,.10); color: #ffd98a; }
+  .chip.deadlock { border-color: var(--red); background: rgba(239,107,107,.12); color: #ffb0b0; }
+  .tag.wait { background: rgba(232,179,74,.18); color: var(--amber); }
+  .tag.deadlock { background: rgba(239,107,107,.22); color: var(--red); }
+  .step-card.wait { border-color: rgba(232,179,74,.7); box-shadow: 0 0 0 1px rgba(232,179,74,.3); }
+  .step-card.deadlock { border-color: rgba(239,107,107,.8); box-shadow: 0 0 0 1px rgba(239,107,107,.4); }
+  .verdict.warn { background: rgba(232,179,74,.18); color: var(--amber); }
+  .status-pill.waiting { border-color: #8a6a22; color: #ffd98a; }
+  .lock-row, .wait-row { font-family: var(--mono); font-size: 12px; padding: 5px 0;
+                         border-bottom: 1px dashed var(--line); }
+  .lock-row:last-child, .wait-row:last-child { border-bottom: none; }
+  .lock-mode { font-weight: 700; display: inline-block; min-width: 16px; text-align: center;
+               border-radius: 4px; padding: 0 4px; margin-right: 4px; }
+  .lock-mode.X { color: #ffb0b0; background: rgba(239,107,107,.15); }
+  .lock-mode.S { color: #9be8c6; background: rgba(70,201,143,.12); }
 </style>
 </head>
 <body>
 <header>
   <h1>事务交错推演（Transaction Interleaving Playground）</h1>
-  <p>编辑初始键值与 2～3 条事务脚本，轮转调度生成全局序列，逐步对比 Read Uncommitted、Read Committed、Snapshot Isolation 的读值来源、版本链与依赖图；也可输入自定义执行顺序，与默认轮转做调度对照。</p>
+  <p>编辑初始键值与 2～3 条事务脚本，轮转调度生成全局序列，逐步对比 Read Uncommitted、Read Committed、Snapshot Isolation 的读值来源、版本链与依赖图；也可输入自定义执行顺序与默认轮转做调度对照，或切换到严格两阶段锁（Strict 2PL）查看加锁、等待与死锁回滚的实际执行过程。</p>
 </header>
 <main>
   <section class="panel">
@@ -288,6 +304,18 @@ y=0</textarea>
         </div>
         <div class="right-col">
           <div id="alertsBox"></div>
+          <div class="panel" style="margin:0;display:none" id="lockPanel">
+            <h2 style="margin-bottom:8px">锁表（当前步）</h2>
+            <div id="lockBox"></div>
+          </div>
+          <div class="panel" style="margin:0;display:none" id="waitPanel">
+            <h2 style="margin-bottom:8px">等待关系（当前步）</h2>
+            <div id="waitBox"></div>
+          </div>
+          <div class="panel" style="margin:0;display:none" id="finalPanel">
+            <h2 style="margin-bottom:8px">最终已提交状态</h2>
+            <div id="finalBox"></div>
+          </div>
           <div class="panel" style="margin:0">
             <h2 style="margin-bottom:8px">WR / WW / RW 依赖图（仅已提交事务）</h2>
             <svg class="graph" id="graphSvg" viewBox="0 0 400 260"></svg>
@@ -306,7 +334,7 @@ y=0</textarea>
     </div>
   </section>
   <section id="emptyHint" class="panel placeholder">
-    配置好脚本后点击「生成调度并推演」，三种隔离级别共用默认轮转调度、结果并排可比；
+    配置好脚本后点击「生成调度并推演」，RU / RC / SI 共用默认轮转调度、S2PL 按加锁规则实际调度，结果并排可比；
     或填写自定义执行顺序后点击「对照推演」，与默认轮转逐侧对比。
   </section>
 </main>
@@ -318,12 +346,14 @@ const TXN_COLORS = { T1: "var(--t1)", T2: "var(--t2)", T3: "var(--t3)" };
 const MODE_LABEL = {
   RU: "Read Uncommitted（读未提交）",
   RC: "Read Committed（读已提交）",
-  SI: "Snapshot Isolation（快照隔离）"
+  SI: "Snapshot Isolation（快照隔离）",
+  S2PL: "严格两阶段锁（Strict 2PL）"
 };
 const MODE_RULE = {
   RU: "每次读取取键上的最新写入（含其他事务未提交版本）。",
   RC: "每次读取只取键上最新已提交版本；不读未提交数据，也不看自己未提交的写。",
-  SI: "读取基于 BEGIN 时的快照，自身写入优先；快照后同键被他人提交，则提交时整笔回滚（首提交者胜）。"
+  SI: "读取基于 BEGIN 时的快照，自身写入优先；快照后同键被他人提交，则提交时整笔回滚（首提交者胜）。",
+  S2PL: "T1~T3 轮流尝试队头操作：READ 取共享锁、WRITE 取排他锁（共享锁可升级），锁持有到提交/回滚；冲突则保留队头等待、锁释放后重试；等待成环时回滚环内编号最大事务。读己之写优先，否则读按提交顺序最新的已提交版本。"
 };
 
 const EXAMPLES = [
@@ -366,6 +396,36 @@ const EXAMPLES = [
       "BEGIN\nWRITE x 1\nREAD a\nCOMMIT",
       "BEGIN\nWRITE x 2\nCOMMIT",
       "BEGIN\nREAD b\nREAD c\nREAD x\nCOMMIT"
+    ]
+  },
+  {
+    name: "示例5 · 锁等待与重试",
+    desc: "S2PL：T2 读 x 时 T1 持有排他锁 → 保留队头等待；T1 提交释放锁后 T2 重试成功，读到 T1 已提交的 5，随后读到自己的写入 6。",
+    initial: "x=0",
+    enableT3: false,
+    txns: [
+      "BEGIN\nWRITE x 5\nCOMMIT",
+      "BEGIN\nREAD x\nWRITE x 6\nREAD x\nCOMMIT"
+    ]
+  },
+  {
+    name: "示例6 · 死锁与回滚",
+    desc: "S2PL：T1 持 x 写 y、T2 持 y 写 x，等待成环 → 回滚环内编号最大的 T2（撤销 y=2、跳过剩余操作、释放锁），T1 重试成功并提交。",
+    initial: "x=0\ny=0",
+    enableT3: false,
+    txns: [
+      "BEGIN\nWRITE x 1\nWRITE y 1\nCOMMIT",
+      "BEGIN\nWRITE y 2\nWRITE x 2\nCOMMIT"
+    ]
+  },
+  {
+    name: "示例7 · 锁升级死锁",
+    desc: "S2PL：T1/T2 各持 x 的共享锁又都要升级为排他锁 → 互相等待成环，回滚 T2；T1 升级成功并读到自己的写入 9。",
+    initial: "x=0",
+    enableT3: false,
+    txns: [
+      "BEGIN\nREAD x\nWRITE x 9\nREAD x\nCOMMIT",
+      "BEGIN\nREAD x\nWRITE x 8\nCOMMIT"
     ]
   }
 ];
@@ -430,21 +490,30 @@ async function run() {
   if (txns.some(t => !t.trim())) {
     return showError("T1、T2（以及启用时的 T3）脚本都不能为空。");
   }
-  let resp;
+  const payload = JSON.stringify({ initial: $("initial").value, txns });
+  let simResp, s2plResp;
   try {
-    resp = await fetch("/api/simulate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ initial: $("initial").value, txns })
-    });
+    [simResp, s2plResp] = await Promise.all([
+      fetch("/api/simulate", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: payload
+      }),
+      fetch("/api/s2pl", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: payload
+      })
+    ]);
   } catch (e) {
     return showError("网络错误：" + e.message);
   }
-  const data = await resp.json();
-  if (!resp.ok) {
+  const data = await simResp.json();
+  if (!simResp.ok) {
     return showError(data.detail || "推演失败");
   }
+  const s2plData = await s2plResp.json();
+  if (!s2plResp.ok) {
+    return showError(s2plData.detail || "S2PL 推演失败");
+  }
   hideError();
+  data.results.S2PL = s2plData.result;
   state.data = data;
   state.cmp = null;
   state.view = "single";
@@ -549,18 +618,32 @@ function hideError() { $("errorBox").style.display = "none"; }
 // 标签页与播放
 // ---------------------------------------------------------------------------
 
+// 单跑视图含 S2PL 标签；调度对照视图只有 RU/RC/SI（S2PL 自行决定调度，不参与对照）
+function modeList() {
+  if (state.view === "compare") return ["RU", "RC", "SI"];
+  const results = currentResults();
+  return results && results.S2PL ? ["RU", "RC", "SI", "S2PL"] : ["RU", "RC", "SI"];
+}
+
 function renderTabs() {
   const tabs = $("tabs");
   tabs.innerHTML = "";
   const results = currentResults();
   if (!results) return;
-  for (const m of ["RU", "RC", "SI"]) {
-    const g = results[m].graph;
+  for (const m of modeList()) {
     const div = document.createElement("div");
     div.className = "tab" + (m === state.mode ? " active" : "");
-    div.innerHTML = `${esc(MODE_LABEL[m])}` +
-      `<span class="verdict ${g.has_cycle ? "bad" : "ok"}">` +
-      `${g.has_cycle ? "环!" : "可串行化"}</span>`;
+    let verdict;
+    if (m === "S2PL") {
+      const dl = (results.S2PL.deadlocks || []).length;
+      verdict = `<span class="verdict ${dl ? "warn" : "ok"}">` +
+        `${dl ? `死锁回滚 ${dl} 次` : "无死锁"}</span>`;
+    } else {
+      const g = results[m].graph;
+      verdict = `<span class="verdict ${g.has_cycle ? "bad" : "ok"}">` +
+        `${g.has_cycle ? "环!" : "可串行化"}</span>`;
+    }
+    div.innerHTML = `${esc(MODE_LABEL[m])}` + verdict;
     div.onclick = () => { stopPlay(); state.mode = m; renderTabs(); render(); };
     tabs.appendChild(div);
   }
@@ -689,21 +772,34 @@ function render() {
   const r = result();
   const n = r.steps.length;
   state.idx = Math.max(0, Math.min(state.idx, n - 1));
+  const step = r.steps[state.idx];
+  const isS2PL = state.mode === "S2PL";
   const sideTag = state.view === "compare" && state.cmp
     ? `【${state.side === "default" ? "默认轮转" : "自定义顺序"}】` : "";
   $("posText").textContent = `${sideTag}第 ${state.idx + 1} / ${n} 步 · ${MODE_RULE[state.mode]}`;
   renderChips(r);
-  renderStep(r.steps[state.idx]);
-  renderChains(r.steps[state.idx]);
-  renderStatus(r.steps[state.idx]);
+  if (isS2PL) renderStepS2PL(step); else renderStep(step);
+  renderChains(step);
+  renderStatus(step);
   renderAlerts(r);
   renderGraph(r.graph);
+  $("lockPanel").style.display = isS2PL ? "" : "none";
+  $("waitPanel").style.display = isS2PL ? "" : "none";
+  $("finalPanel").style.display = isS2PL ? "" : "none";
+  if (isS2PL) {
+    renderLocks(step);
+    renderWaits(step);
+    renderFinal(r);
+  }
 }
 
 function opShort(step) {
-  if (step.op === "READ") return `READ ${step.key}`;
-  if (step.op === "WRITE") return `WRITE ${step.key} ${fmt(step.value)}`;
-  return step.op;
+  if (step.event === "deadlock") return `💀 回滚 ${step.victim}`;
+  let base;
+  if (step.op === "READ") base = `READ ${step.key}`;
+  else if (step.op === "WRITE") base = `WRITE ${step.key} ${fmt(step.value)}`;
+  else base = step.op;
+  return step.event === "wait" ? `⏳ ${base}` : base;
 }
 
 function renderChips(r) {
@@ -716,6 +812,8 @@ function renderChips(r) {
       (i === state.idx ? " current" : "") +
       (s.in_cycle ? " cycle" : "") +
       (s.dirty_candidate ? " dirty" : "") +
+      (s.event === "wait" ? " wait" : "") +
+      (s.event === "deadlock" ? " deadlock" : "") +
       (s.seq === fdSeq ? " firstdiff" : "");
     c.innerHTML = `<span class="cseq">${s.seq}</span>${s.txn} ${esc(opShort(s))}`;
     c.onclick = () => { stopPlay(); state.idx = i; render(); };
@@ -785,6 +883,132 @@ function sourceLabel(src) {
   }[src] || src;
 }
 
+// ---------------------------------------------------------------------------
+// 严格两阶段锁（S2PL）渲染
+// ---------------------------------------------------------------------------
+
+function lockModeLabel(m) { return m === "X" ? "排他锁(X)" : "共享锁(S)"; }
+
+function lockListText(list) {
+  return list && list.length
+    ? list.map(l => `${esc(l.key)} 的${lockModeLabel(l.mode)}`).join("，")
+    : "无";
+}
+
+function renderStepS2PL(step) {
+  const card = $("stepCard");
+  card.className = "step-card" +
+    (step.event === "deadlock" ? " deadlock" : step.event === "wait" ? " wait" : "");
+  let tags = "";
+  if (step.event === "wait") tags += `<span class="tag wait">锁冲突等待</span>`;
+  if (step.event === "deadlock") tags += `<span class="tag deadlock">死锁回滚</span>`;
+  if (step.resumed) tags += `<span class="tag info">重试成功</span>`;
+  if (step.lock_acquired && step.lock_acquired.upgrade)
+    tags += `<span class="tag info">S→X 升级</span>`;
+
+  let inner = `
+    <div class="step-top">
+      <span class="seq-badge">#${step.seq}</span>
+      ${txnBadge(step.txn)}
+      <span class="op-text">${esc(opShort(step))}</span>
+      ${tags}
+    </div>
+    <p class="step-info">${esc(step.info)}</p>`;
+
+  if (step.event === "wait") {
+    const lr = step.lock_request;
+    inner += `<div class="kv-mini">
+      <span class="k">申请锁</span><span class="v">${esc(lr.key)} 的 ${lockModeLabel(lr.mode)}${lr.upgrade ? "（S→X 升级）" : ""}</span>
+      <span class="k">持锁阻塞者</span><span class="v">${step.blockers.map(esc).join("、")}</span>
+      <span class="k">处理</span><span class="v">操作保留队头，转试其他事务；锁释放后重试</span>
+    </div>`;
+  } else if (step.event === "deadlock") {
+    const undone = step.undone.length
+      ? step.undone.map(u => `${esc(u.key)} v${u.vid}=${esc(fmt(u.value))}`).join("，") : "无";
+    inner += `<div class="kv-mini">
+      <span class="k">等待环</span><span class="v">${esc(step.cycle.join(" → "))} → ${esc(step.cycle[0])}</span>
+      <span class="k">回滚受害者</span><span class="v">${esc(step.victim)}（环内编号最大）</span>
+      <span class="k">撤销写入</span><span class="v">${undone}</span>
+      <span class="k">释放锁</span><span class="v">${lockListText(step.locks_released)}</span>
+      <span class="k">剩余操作</span><span class="v">全部跳过</span>
+    </div>`;
+  } else if (step.op === "READ" && step.read_source !== "missing") {
+    inner += `<div class="kv-mini">
+      <span class="k">读到版本</span><span class="v">v${step.read_vid}</span>
+      <span class="k">读值</span><span class="v">${esc(fmt(step.read_value))}</span>
+      <span class="k">写入者</span><span class="v">${step.read_writer === "INIT" ? "初始数据" : esc(step.read_writer)}</span>
+      <span class="k">来源类型</span><span class="v">${sourceLabel(step.read_source)}</span>
+    </div>`;
+  } else if (step.op === "READ") {
+    inner += `<div class="kv-mini"><span class="k">读值</span><span class="v">∅（键 ${esc(step.key)} 不存在）</span></div>`;
+  }
+  if (step.event === "exec" && step.op === "WRITE") {
+    inner += `<div class="kv-mini">
+      <span class="k">新版本</span><span class="v">v${step.new_vid}（未提交）</span>
+      <span class="k">写入值</span><span class="v">${esc(fmt(step.value))}</span>
+    </div>`;
+  }
+  if (step.event === "exec" && step.lock_acquired) {
+    const la = step.lock_acquired;
+    inner += `<div class="kv-mini">
+      <span class="k">取得锁</span><span class="v">${esc(la.key)} 的 ${lockModeLabel(la.mode)}${la.upgrade ? "（S→X 升级）" : ""}</span>
+    </div>`;
+  }
+  if (step.event === "exec" && step.locks_released) {
+    inner += `<div class="kv-mini">
+      <span class="k">释放锁</span><span class="v">${lockListText(step.locks_released)}</span>
+    </div>`;
+  }
+  card.innerHTML = inner;
+}
+
+function renderLocks(step) {
+  const box = $("lockBox");
+  const locks = step.locks_after || {};
+  const keys = Object.keys(locks);
+  if (!keys.length) {
+    box.innerHTML = `<div class="placeholder" style="padding:10px">（当前无持锁）</div>`;
+    return;
+  }
+  box.innerHTML = keys.map(k => {
+    const l = locks[k];
+    return `<div class="lock-row"><span class="lock-mode ${l.mode}">${l.mode}</span>` +
+      `<strong>${esc(k)}</strong> ← ${l.holders.map(h => txnBadge(h)).join(" ")}</div>`;
+  }).join("");
+}
+
+function renderWaits(step) {
+  const box = $("waitBox");
+  const edges = step.wait_edges_after || [];
+  if (!edges.length) {
+    box.innerHTML = `<div class="placeholder" style="padding:10px">（当前无等待）</div>`;
+    return;
+  }
+  box.innerHTML = edges.map(e =>
+    `<div class="wait-row">${txnBadge(e.from)} <span style="color:var(--amber)">─等待→</span> ` +
+    `${txnBadge(e.to)} <span style="color:var(--muted)">（${esc(e.key)} 的 ${lockModeLabel(e.mode)}）</span></div>`
+  ).join("");
+}
+
+function renderFinal(r) {
+  const box = $("finalBox");
+  const fs = r.final_state || {};
+  const keys = Object.keys(fs);
+  let html = keys.length
+    ? keys.map(k => {
+        const v = fs[k];
+        return `<div class="lock-row"><strong>${esc(k)}</strong> = ` +
+          (v ? `${esc(fmt(v.value))} <span style="color:var(--muted)">(v${v.vid}, ${v.writer === "INIT" ? "初始" : esc(v.writer)})</span>`
+             : `<span style="color:var(--muted)">∅ 无已提交版本</span>`) + `</div>`;
+      }).join("")
+    : `<div class="placeholder" style="padding:10px">（无键）</div>`;
+  html += `<div style="margin-top:8px;font-size:12px;color:var(--muted)">` +
+    Object.entries(r.txn_final || {}).map(([n, t]) =>
+      `${n}：${statusLabel(t.status)}${t.deadlock_victim ? "（死锁受害者）" : ""}`
+    ).join("；") + `</div>`;
+  box.innerHTML = html;
+}
+
 function renderChains(step) {
   const box = $("chainsBox");
   const chains = step.chains_after || {};
@@ -817,14 +1041,18 @@ function renderStatus(step) {
   box.innerHTML = "";
   for (const [name, st] of Object.entries(step.txns_after || {})) {
     const pill = document.createElement("span");
-    pill.className = `status-pill ${st.status}`;
+    pill.className = `status-pill ${st.status}` + (st.waiting ? " waiting" : "");
     let tail = "";
     if (st.commit_seq != null) tail = ` @${st.commit_seq}提交`;
     else if (st.abort_seq != null) tail = ` @${st.abort_seq}回滚`;
     else if (st.begin_seq != null) tail = ` @${st.begin_seq}开始`;
-    pill.style.borderColor = (st.status === "active" || st.status === "committed")
+    let lockTxt = "";
+    if (st.locks && st.locks.length)
+      lockTxt = " [" + st.locks.map(l => `${l.key}:${l.mode}`).join(" ") + "]";
+    const waitTxt = st.waiting ? " ⏳等待中" : "";
+    pill.style.borderColor = (st.status === "active" || st.status === "committed") && !st.waiting
       ? (name === "T1" ? "var(--t1)" : name === "T2" ? "var(--t2)" : "var(--t3)") : undefined;
-    pill.innerHTML = `${name}：${statusLabel(st.status)}<span style="opacity:.7">${tail}</span>`;
+    pill.innerHTML = `${name}：${statusLabel(st.status)}${waitTxt}<span style="opacity:.7">${tail}${lockTxt}</span>`;
     box.appendChild(pill);
   }
 }
@@ -835,6 +1063,19 @@ function statusLabel(s) {
 
 function renderAlerts(r) {
   const box = $("alertsBox");
+  if (state.mode === "S2PL") {
+    let html = "";
+    const dls = r.deadlocks || [];
+    if (dls.length) {
+      html += `<div class="alert cycle"><strong>⚠ 死锁处理 ${dls.length} 次（回滚环内编号最大的事务）</strong>
+        <ul>${dls.map(d => `<li>第 ${d.seq} 步：环 ${esc(d.cycle.join(" → "))} → ${esc(d.cycle[0])}，回滚 ${esc(d.victim)}</li>`).join("")}</ul></div>`;
+    } else {
+      html += `<div class="alert ok">✔ 本次调度未发生死锁。</div>`;
+    }
+    html += `<div class="alert ok" style="font-size:12px">严格两阶段锁：锁持有到提交/回滚才释放，不产生脏读与不可重复读；回滚事务的写入不出现在任何后续读取与最终状态中。</div>`;
+    box.innerHTML = html;
+    return;
+  }
   let html = "";
   const g = r.graph;
   if (g.has_cycle) {
